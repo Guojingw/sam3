@@ -127,6 +127,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--fail-fast", action="store_true", help="Stop after the first failed case."
     )
+    parser.add_argument(
+        "--window-ratios",
+        type=float,
+        nargs="+",
+        default=[],
+        help=(
+            "Window lengths as fractions of each target camera's sampled frames. "
+            "Example: 0.20 0.25 0.30. When provided, this overrides "
+            "--window-sizes."
+        ),
+    )
+
+    parser.add_argument(
+        "--window-stride-ratio",
+        type=float,
+        default=0.05,
+        help=(
+            "Sliding stride as a fraction of each target camera's sampled frames "
+            "when --window-ratios is used. Example: 0.05."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -215,6 +236,49 @@ def decode_coco_rle(rle_payload: Mapping[str, Any]) -> np.ndarray:
         )
     return mask
 
+def align_mask_to_image(
+    mask: np.ndarray,
+    image: Image.Image,
+    aspect_tolerance: float = 1e-3,
+) -> np.ndarray:
+    """Resize an annotation mask to the actual JPG resolution when necessary.
+
+    Mask area statistics must still be computed from the original annotation
+    resolution. This aligned mask is only for saved visualization assets.
+    """
+    image_width, image_height = image.size
+    mask_height, mask_width = mask.shape
+
+    if (mask_width, mask_height) == (image_width, image_height):
+        return mask.astype(bool)
+
+    mask_aspect = mask_width / mask_height
+    image_aspect = image_width / image_height
+
+    if abs(mask_aspect - image_aspect) > aspect_tolerance:
+        raise ValueError(
+            "Image and mask aspect ratios differ: "
+            f"image={image.size}, mask={(mask_width, mask_height)}. "
+            "Refusing to stretch the mask."
+        )
+
+    resized = Image.fromarray(
+        mask.astype(np.uint8) * 255,
+        mode="L",
+    ).resize(
+        (image_width, image_height),
+        resample=Image.Resampling.NEAREST,
+    )
+
+    aligned_mask = np.asarray(resized, dtype=np.uint8) > 0
+
+    print(
+        "[INFO] Aligned source mask for visualization: "
+        f"{mask_width}x{mask_height} -> {image_width}x{image_height}",
+        flush=True,
+    )
+
+    return aligned_mask
 
 def save_binary_mask(mask: np.ndarray, path: Path) -> None:
     Image.fromarray(mask.astype(np.uint8) * 255, mode="L").save(path)
@@ -413,10 +477,22 @@ def materialize_source_outputs(
         out_dir = case_dir / "source_view_bests" / slugify(view_name)
         out_dir.mkdir(parents=True, exist_ok=True)
         image = Image.open(record.image_path).convert("RGB")
-        mask = decoded_masks[(record.view_name, record.frame_id)]
+        native_mask = decoded_masks[(record.view_name, record.frame_id)]
+        aligned_mask = align_mask_to_image(native_mask, image)
+
         image.save(out_dir / "best_frame.jpg", quality=95)
-        save_binary_mask(mask, out_dir / "best_mask.png")
-        save_mask_overlay(image, mask, out_dir / "best_mask_overlay.png")
+
+        # 与 JPG 对齐的 mask，供后续查看和处理。
+        save_binary_mask(aligned_mask, out_dir / "best_mask.png")
+
+        # 保留 annotation 原始分辨率的 mask。
+        save_binary_mask(native_mask, out_dir / "best_mask_native.png")
+
+        save_mask_overlay(
+            image,
+            aligned_mask,
+            out_dir / "best_mask_overlay.png",
+        )
         summary[view_name] = {
             "view_name": view_name,
             "frame_id": record.frame_id,
@@ -436,11 +512,35 @@ def materialize_source_outputs(
         }
 
     best_image = Image.open(global_best.image_path).convert("RGB")
-    best_mask = decoded_masks[(global_best.view_name, global_best.frame_id)]
-    best_image.save(case_dir / "source_best_frame.jpg", quality=95)
-    save_binary_mask(best_mask, case_dir / "source_best_mask.png")
+    native_best_mask = decoded_masks[
+        (global_best.view_name, global_best.frame_id)
+    ]
+    aligned_best_mask = align_mask_to_image(
+        native_best_mask,
+        best_image,
+    )
+
+    best_image.save(
+        case_dir / "source_best_frame.jpg",
+        quality=95,
+    )
+
+    # 与 source JPG 相同分辨率。
+    save_binary_mask(
+        aligned_best_mask,
+        case_dir / "source_best_mask.png",
+    )
+
+    # annotation 原始分辨率。
+    save_binary_mask(
+        native_best_mask,
+        case_dir / "source_best_mask_native.png",
+    )
+
     save_mask_overlay(
-        best_image, best_mask, case_dir / "source_best_mask_overlay.png"
+        best_image,
+        aligned_best_mask,
+        case_dir / "source_best_mask_overlay.png",
     )
     return global_best, summary
 
@@ -635,6 +735,8 @@ def generate_target_windows(
     target_prefix: str,
     window_sizes: Sequence[int],
     window_stride: int,
+    window_ratios: Sequence[float],
+    window_stride_ratio: float,
     target_sample_every: int,
     max_gap_factor: float,
     max_windows_per_cam: int,
@@ -671,6 +773,48 @@ def generate_target_windows(
         sampled_frames = all_frames[::target_sample_every]
         full_ids = [frame.frame_id for frame in all_frames]
         sampled_ids = [frame.frame_id for frame in sampled_frames]
+        
+        total_sampled_frames = len(sampled_frames)
+
+        if total_sampled_frames < 2:
+            warnings.append(
+                f"{target_dir.name} has fewer than 2 sampled frames; skipping."
+            )
+            continue
+
+        if window_ratios:
+            size_to_requested_ratio: Dict[int, float] = {}
+
+            for ratio in sorted(set(window_ratios)):
+                window_size = max(
+                    2,
+                    int(round(total_sampled_frames * ratio)),
+                )
+                window_size = min(window_size, total_sampled_frames)
+                size_to_requested_ratio[window_size] = float(ratio)
+
+            window_specs = sorted(
+                (window_size, requested_ratio)
+                for window_size, requested_ratio
+                in size_to_requested_ratio.items()
+            )
+
+            effective_window_stride = max(
+                1,
+                int(round(total_sampled_frames * window_stride_ratio)),
+            )
+        else:
+            window_specs = [
+                (
+                    int(window_size),
+                    float(window_size / total_sampled_frames),
+                )
+                for window_size in sorted(set(window_sizes))
+                if 2 <= window_size <= total_sampled_frames
+            ]
+
+            effective_window_stride = window_stride
+            
         full_step = median_positive_gap(full_ids)
         sampled_step = median_positive_gap(sampled_ids)
         max_gap = (
@@ -679,27 +823,38 @@ def generate_target_windows(
         runs = split_contiguous_runs(sampled_frames, max_gap)
 
         candidate_windows: List[Tuple[int, List[FrameImage], int]] = []
+        candidate_windows: List[
+            Tuple[int, List[FrameImage], int, float]
+        ] = []
+
         for run_index, run in enumerate(runs):
-            for window_size in sorted(set(window_sizes)):
-                for window in sliding_windows(run, window_size, window_stride):
-                    candidate_windows.append((run_index, window, window_size))
-        candidate_windows.sort(
-            key=lambda item: (
-                item[1][0].frame_id,
-                item[2],
-                item[1][-1].frame_id,
-            )
-        )
-        candidate_windows = uniformly_limit(
-            candidate_windows, max_windows_per_cam
-        )
+            for window_size, requested_ratio in window_specs:
+                if window_size > len(run):
+                    continue
+
+                for window in sliding_windows(
+                    run,
+                    window_size,
+                    effective_window_stride,
+                ):
+                    candidate_windows.append(
+                        (
+                            run_index,
+                            window,
+                            window_size,
+                            requested_ratio,
+                        )
+                    )
 
         camera_windows: List[Dict[str, Any]] = []
         camera_out = case_dir / "target_temporal_windows" / target_dir.name
         camera_out.mkdir(parents=True, exist_ok=True)
-        for window_index, (run_index, window, window_size) in enumerate(
-            candidate_windows
-        ):
+        for window_index, (
+            run_index,
+            window,
+            window_size,
+            requested_ratio,
+        ) in enumerate(candidate_windows):
             frame_ids = [frame.frame_id for frame in window]
             gaps = [b - a for a, b in zip(frame_ids, frame_ids[1:])]
             filename = (
