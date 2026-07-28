@@ -10,12 +10,19 @@ set -euo pipefail
 
 REPO="$HOME/worldmodel/sam3"
 ASSETS="$REPO/temporal_cross_view_assets_ratio_batch6"
-ENV_DIR="$HOME/scratch/qwen35-4b/env"
-MODEL_DIR="$HOME/scratch/qwen35-4b/model"
-WORK_DIR="$HOME/scratch/qwen35-4b/temporal_batch6_work"
+SCRATCH="/scratch/users/ntu/$USER"
+ENV_DIR="$SCRATCH/qwen35-4b/env"
+MODEL_DIR="$SCRATCH/qwen35-4b/model"
+WORK_DIR="$SCRATCH/qwen35-4b/temporal_batch6_work"
 
 source "$ENV_DIR/bin/activate"
 cd "$ASSETS"
+
+echo "host=$(hostname)"
+echo "job_id=${PBS_JOBID:-unknown}"
+echo "env=$ENV_DIR"
+echo "model=$MODEL_DIR"
+nvidia-smi
 
 python qwen_temporal_runner.py \
   --assets-root "$ASSETS" \
