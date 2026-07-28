@@ -657,6 +657,105 @@ def draw_frame_panel(
     return panel
 
 
+def render_selected_contact_sheet(
+    case_dir: Path,
+    output_dir: Path,
+    result: Mapping[str, Any],
+    evidence_map: Mapping[tuple[str, int], Mapping[str, Any]],
+    temporal_index: Mapping[str, Any],
+    work_case: Path,
+) -> Path:
+    output = output_dir / "selected_best_segment_contact_sheet.jpg"
+    best = result.get("best_segment")
+    if not best:
+        canvas = Image.new("RGB", (1400, 620), (246, 243, 234))
+        source = fit_image(
+            Image.open(work_case / "source_anchor_isolated_rgb.png"),
+            (430, 430),
+        )
+        canvas.paste(source, (45, 135))
+        draw = ImageDraw.Draw(canvas)
+        draw.text(
+            (45, 35),
+            "UNCERTAIN: NO LEGAL TEMPORAL WINDOW",
+            font=font(32),
+            fill=(145, 38, 32),
+        )
+        draw.text(
+            (520, 150),
+            f"Object: {result['source_identity'].get('object_identity')}",
+            font=font(23),
+            fill=(20, 27, 31),
+        )
+        draw.text(
+            (520, 195),
+            f"Source mask: {result['source_best_mask']}",
+            font=font(20),
+            fill=(20, 27, 31),
+        )
+        y = 255
+        for line in textwrap.wrap(str(result.get("uncertainty", "")), width=68):
+            draw.text((520, y), line, font=font(19), fill=(45, 51, 54))
+            y += 30
+        draw.text(
+            (520, 470),
+            "Selected window_id: NONE | frame range: NONE",
+            font=font(21),
+            fill=(145, 38, 32),
+        )
+        canvas.save(output, quality=96)
+        return output
+
+    window = next(
+        item
+        for item in all_windows(temporal_index)
+        if item["window_id"] == best["window_id"]
+    )
+    sheet = Image.open(case_dir / window["contact_sheet"]).convert("RGB")
+    banner_height = 105
+    canvas = Image.new(
+        "RGB", (sheet.width, sheet.height + banner_height), (246, 243, 234)
+    )
+    canvas.paste(sheet, (0, banner_height))
+    draw = ImageDraw.Draw(canvas)
+    draw.text(
+        (15, 12),
+        (
+            f"SELECTED {best['window_id']} | frames "
+            f"{best['start_frame']}-{best['end_frame']} | "
+            f"object: {result['source_identity'].get('object_identity')}"
+        ),
+        font=font(22),
+        fill=(20, 27, 31),
+    )
+    draw.text(
+        (15, 55),
+        (
+            f"Source mask: {result['source_best_mask']} "
+            f"(first-person frame {result['source_best_frame']})"
+        ),
+        font=font(19),
+        fill=(20, 27, 31),
+    )
+    for cell in window["sheet_layout"]["cells"]:
+        frame_id = int(cell["frame_id"])
+        item = evidence_map[(window["cam"], frame_id)]
+        box = item.get("bbox_xyxy_normalized")
+        if not box:
+            continue
+        left, top, right, bottom = cell["image_xyxy"]
+        x1, y1, x2, y2 = box
+        mapped = (
+            round(left + x1 * (right - left)),
+            round(banner_height + top + y1 * (bottom - top)),
+            round(left + x2 * (right - left)),
+            round(banner_height + top + y2 * (bottom - top)),
+        )
+        draw.rectangle(mapped, outline=(0, 230, 170), width=4)
+    canvas.save(output, quality=96)
+    return output
+
+
 def render_result(
     case_dir: Path,
     work_case: Path,
@@ -710,6 +809,14 @@ def render_result(
     evidence_map = {
         (item["cam"], item["frame_id"]): item for item in evidence
     }
+    selected_sheet = render_selected_contact_sheet(
+        case_dir,
+        output_dir,
+        result,
+        evidence_map,
+        temporal_index,
+        work_case,
+    )
     selected_items: list[dict[str, Any]] = []
     if best:
         window = next(
@@ -807,6 +914,7 @@ def render_result(
             "selected_frame_range": (
                 [best["start_frame"], best["end_frame"]] if best else None
             ),
+            "selected_contact_sheet": selected_sheet.name,
             "comparison_image": output.name,
             "visual_check": "pending_human_review",
         },
