@@ -174,7 +174,7 @@ def make_frame_catalog(
 class Qwen:
     def __init__(self, model_path: str, max_new_tokens: int) -> None:
         import torch
-        from transformers import AutoModelForImageTextToText, AutoProcessor
+        from transformers import AutoModelForMultimodalLM, AutoProcessor
 
         self.torch = torch
         self.max_new_tokens = max_new_tokens
@@ -183,7 +183,7 @@ class Qwen:
             model_path, trust_remote_code=True
         )
         print("Loading Qwen3.5-4B...", flush=True)
-        self.model = AutoModelForImageTextToText.from_pretrained(
+        self.model = AutoModelForMultimodalLM.from_pretrained(
             model_path,
             torch_dtype="auto",
             device_map="auto",
@@ -194,9 +194,7 @@ class Qwen:
     def ask(self, images: list[Path], prompt: str) -> Any:
         content: list[dict[str, Any]] = []
         for image_path in images:
-            content.append(
-                {"type": "image", "image": Image.open(image_path).convert("RGB")}
-            )
+            content.append({"type": "image", "path": str(image_path.resolve())})
         content.append({"type": "text", "text": prompt})
         messages = [{"role": "user", "content": content}]
         inputs = self.processor.apply_chat_template(
@@ -205,6 +203,7 @@ class Qwen:
             add_generation_prompt=True,
             return_dict=True,
             return_tensors="pt",
+            enable_thinking=False,
         )
         inputs = inputs.to(self.model.device)
         with self.torch.inference_mode():
