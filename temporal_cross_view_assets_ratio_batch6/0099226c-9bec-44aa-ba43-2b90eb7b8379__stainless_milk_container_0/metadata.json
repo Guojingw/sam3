@@ -1,0 +1,47 @@
+{
+  "schema_version": 2,
+  "case_id": "0099226c-9bec-44aa-ba43-2b90eb7b8379__stainless_milk_container_0",
+  "take_id": "0099226c-9bec-44aa-ba43-2b90eb7b8379",
+  "target_object": "stainless milk container_0",
+  "take_dir": "/scratch/users/ntu/gwang016/datasets/Ego-Exo4D-Relation-Test/extracted/work/yuqian_fu/Ego/data_segswap_test/0099226c-9bec-44aa-ba43-2b90eb7b8379",
+  "annotation_path": "/scratch/users/ntu/gwang016/datasets/Ego-Exo4D-Relation-Test/extracted/work/yuqian_fu/Ego/data_segswap_test/0099226c-9bec-44aa-ba43-2b90eb7b8379/annotation.json",
+  "source_best": {
+    "view_name": "aria01_214-1",
+    "frame_id": 960,
+    "mask_area_pixels": 57900,
+    "mask_area_ratio": 0.02920607889979339,
+    "source_frame": "source_best_frame.jpg",
+    "source_mask": "source_best_mask.png",
+    "source_mask_overlay": "source_best_mask_overlay.png"
+  },
+  "per_source_view_best": {
+    "aria01_214-1": {
+      "view_name": "aria01_214-1",
+      "frame_id": 960,
+      "mask_area_pixels": 57900,
+      "mask_area_ratio": 0.02920607889979339,
+      "frame_path": "source_view_bests/aria01_214-1/best_frame.jpg",
+      "mask_path": "source_view_bests/aria01_214-1/best_mask.png",
+      "overlay_path": "source_view_bests/aria01_214-1/best_mask_overlay.png"
+    }
+  },
+  "target_cameras": {
+    "cam01": {
+      "window_count": 51,
+      "sampled_frame_count": 146,
+      "video_start_frame": 0,
+      "video_end_frame": 4350,
+      "requested_window_ratios": [
+        0.2,
+        0.25,
+        0.3
+      ]
+    }
+  },
+  "warnings": [],
+  "pipeline_notes": {
+    "source_selection": "Ground-truth COCO RLE mask area ratio.",
+    "target_window_definition": "20%-30% camera-relative windows based on complete sampled target-camera frame count.",
+    "target_selection": "Deferred to local Codex/ChatGPT analysis; no target mask is generated or fabricated."
+  }
+}
