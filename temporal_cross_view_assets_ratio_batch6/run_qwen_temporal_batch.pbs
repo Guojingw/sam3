@@ -1,0 +1,23 @@
+#!/bin/bash
+#PBS -P personal-gwang016
+#PBS -q normal
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=04:00:00
+#PBS -N qwen4b_temporal_batch6
+#PBS -j oe
+
+set -euo pipefail
+
+REPO="$HOME/worldmodel/sam3"
+ASSETS="$REPO/temporal_cross_view_assets_ratio_batch6"
+ENV_DIR="$HOME/scratch/qwen35-4b/env"
+MODEL_DIR="$HOME/scratch/qwen35-4b/model"
+WORK_DIR="$HOME/scratch/qwen35-4b/temporal_batch6_work"
+
+source "$ENV_DIR/bin/activate"
+cd "$ASSETS"
+
+python qwen_temporal_runner.py \
+  --assets-root "$ASSETS" \
+  --model "$MODEL_DIR" \
+  --work-dir "$WORK_DIR"
