@@ -239,6 +239,18 @@ def save_binary_mask(mask: np.ndarray, path: Path) -> None:
     Image.fromarray(mask.astype(np.uint8) * 255, mode="L").save(path)
 
 
+def resize_mask_to_image(mask: np.ndarray, image: Image.Image) -> np.ndarray:
+    """Align an annotation-space mask to its RGB frame without soft edges."""
+    image_size = image.size
+    mask_size = (mask.shape[1], mask.shape[0])
+    if mask_size == image_size:
+        return mask
+    resized = Image.fromarray(mask.astype(np.uint8) * 255, mode="L").resize(
+        image_size, resample=Image.Resampling.NEAREST
+    )
+    return np.asarray(resized, dtype=np.uint8) > 0
+
+
 def save_mask_overlay(
     image: Image.Image,
     mask: np.ndarray,
@@ -432,8 +444,10 @@ def materialize_source_outputs(
         out_dir = case_dir / "source_view_bests" / slugify(view_name)
         out_dir.mkdir(parents=True, exist_ok=True)
         image = Image.open(record.image_path).convert("RGB")
-        mask = decoded_masks[(record.view_name, record.frame_id)]
+        native_mask = decoded_masks[(record.view_name, record.frame_id)]
+        mask = resize_mask_to_image(native_mask, image)
         image.save(out_dir / "best_frame.jpg", quality=95)
+        save_binary_mask(native_mask, out_dir / "best_mask_native.png")
         save_binary_mask(mask, out_dir / "best_mask.png")
         save_mask_overlay(image, mask, out_dir / "best_mask_overlay.png")
         summary[view_name] = {
@@ -447,6 +461,13 @@ def materialize_source_outputs(
             "mask_path": str(
                 Path("source_view_bests") / slugify(view_name) / "best_mask.png"
             ),
+            "native_mask_path": str(
+                Path("source_view_bests")
+                / slugify(view_name)
+                / "best_mask_native.png"
+            ),
+            "source_image_size": [image.width, image.height],
+            "native_mask_size": [native_mask.shape[1], native_mask.shape[0]],
             "overlay_path": str(
                 Path("source_view_bests")
                 / slugify(view_name)
@@ -455,8 +476,10 @@ def materialize_source_outputs(
         }
 
     best_image = Image.open(global_best.image_path).convert("RGB")
-    best_mask = decoded_masks[(global_best.view_name, global_best.frame_id)]
+    native_best_mask = decoded_masks[(global_best.view_name, global_best.frame_id)]
+    best_mask = resize_mask_to_image(native_best_mask, best_image)
     best_image.save(case_dir / "source_best_frame.jpg", quality=95)
+    save_binary_mask(native_best_mask, case_dir / "source_best_mask_native.png")
     save_binary_mask(best_mask, case_dir / "source_best_mask.png")
     save_mask_overlay(
         best_image, best_mask, case_dir / "source_best_mask_overlay.png"
@@ -1027,7 +1050,15 @@ def process_case(case: CaseSpec, args: argparse.Namespace) -> Dict[str, Any]:
             "mask_area_ratio": global_best.mask_area_ratio,
             "source_frame": "source_best_frame.jpg",
             "source_mask": "source_best_mask.png",
+            "source_mask_native": "source_best_mask_native.png",
             "source_mask_overlay": "source_best_mask_overlay.png",
+            "source_image_size": per_view_best[global_best.view_name][
+                "source_image_size"
+            ],
+            "native_mask_size": [
+                global_best.mask_width,
+                global_best.mask_height,
+            ],
         },
         "per_source_view_best": per_view_best,
         "target_cameras": {
@@ -1040,6 +1071,10 @@ def process_case(case: CaseSpec, args: argparse.Namespace) -> Dict[str, Any]:
         "warnings": source_warnings + target_warnings,
         "pipeline_notes": {
             "source_selection": "Ground-truth COCO RLE mask area ratio.",
+            "source_mask_alignment": (
+                "Native annotation mask is preserved separately; source_mask "
+                "uses nearest-neighbor resizing to match the source RGB frame."
+            ),
             "target_selection": (
                 "Deferred to local Codex/ChatGPT temporal analysis; "
                 "no target mask generated here."
