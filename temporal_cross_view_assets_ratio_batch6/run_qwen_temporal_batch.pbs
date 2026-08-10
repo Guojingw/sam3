@@ -13,7 +13,7 @@ ASSETS="$REPO/temporal_cross_view_assets_ratio_batch6"
 SCRATCH="/scratch/users/ntu/$USER"
 PYTHON="$HOME/.conda/envs/sam3/bin/python"
 MODEL_DIR="$SCRATCH/qwen35-4b/model"
-WORK_DIR="$SCRATCH/qwen35-4b/temporal_batch6_work"
+WORK_DIR="$SCRATCH/qwen35-4b/temporal_batch6_work_v2"
 
 cd "$ASSETS"
 

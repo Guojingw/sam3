@@ -20,10 +20,14 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 
 CASE_GLOB = "*__*_0"
-PRESENT_THRESHOLD = 0.65
-WINDOW_PRESENT_FRACTION = 0.75
-MAX_INTERNAL_ABSENT_RUN = 2
-MAX_OCCURRENCE_GAP = 2
+EVIDENCE_SCHEMA_VERSION = 2
+CONFIRMED_THRESHOLD = 0.50
+POSSIBLE_THRESHOLD = 0.45
+WINDOW_SUPPORT_FRACTION = 0.60
+WINDOW_CONFIRMED_FRACTION = 0.30
+MAX_INTERNAL_ABSENT_RUN = 4
+MAX_OCCURRENCE_GAP = 4
+MAX_WINDOWS_TO_VERIFY = 8
 
 
 def parse_args() -> argparse.Namespace:
@@ -84,6 +88,14 @@ def normalized_box(value: Any) -> list[float] | None:
     if box[2] <= box[0] or box[3] <= box[1]:
         return None
     return box
+
+
+def model_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "yes", "1"}
+    return bool(value)
 
 
 def build_source_anchor(case_dir: Path, work_case: Path) -> dict[str, Any]:
@@ -169,6 +181,98 @@ def make_frame_catalog(
         for image in opened.values():
             image.close()
     return catalog
+
+
+def make_context_strip(
+    catalog: Mapping[tuple[str, int], Path],
+    cam: str,
+    frame_id: int,
+    work_case: Path,
+) -> Path:
+    """Show previous/current/next frames while keeping the queried frame clear."""
+    output_dir = work_case / "target_context"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output = output_dir / f"{cam}_{frame_id:06d}_context.jpg"
+    if output.exists():
+        return output
+
+    ids = sorted(value for camera, value in catalog if camera == cam)
+    position = ids.index(frame_id)
+    selected_ids = [
+        ids[max(0, position - 1)],
+        frame_id,
+        ids[min(len(ids) - 1, position + 1)],
+    ]
+    width, height, header = 640, 360, 42
+    canvas = Image.new("RGB", (width * 3, height + header), (238, 238, 234))
+    draw = ImageDraw.Draw(canvas)
+    for index, selected_id in enumerate(selected_ids):
+        image = ImageOps.fit(
+            Image.open(catalog[(cam, selected_id)]).convert("RGB"),
+            (width, height),
+            method=Image.Resampling.LANCZOS,
+        )
+        x = index * width
+        canvas.paste(image, (x, header))
+        is_query = index == 1
+        color = (0, 220, 175) if is_query else (60, 66, 70)
+        draw.rectangle(
+            (x + 2, header + 2, x + width - 3, header + height - 3),
+            outline=color,
+            width=7 if is_query else 2,
+        )
+        label = (
+            f"QUERY frame {selected_id}"
+            if is_query
+            else f"context frame {selected_id}"
+        )
+        draw.text((x + 12, 12), label, fill=(20, 25, 28), font=font(18))
+    canvas.save(output, quality=96)
+    return output
+
+
+def make_window_summary(
+    window: Mapping[str, Any],
+    catalog: Mapping[tuple[str, int], Path],
+    work_case: Path,
+) -> Path:
+    """Create a readable 3x3 summary spanning the complete candidate window."""
+    output_dir = work_case / "window_summaries"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output = output_dir / f"{window['window_id']}.jpg"
+    if output.exists():
+        return output
+
+    frame_ids = [int(value) for value in window["frame_ids"]]
+    sampled_ids = [
+        frame_ids[round(index * (len(frame_ids) - 1) / 8)]
+        for index in range(9)
+    ]
+    cell_width, cell_height, header = 640, 360, 40
+    canvas = Image.new(
+        "RGB",
+        (cell_width * 3, (cell_height + header) * 3),
+        (238, 238, 234),
+    )
+    draw = ImageDraw.Draw(canvas)
+    for index, selected_id in enumerate(sampled_ids):
+        row, column = divmod(index, 3)
+        x = column * cell_width
+        y = row * (cell_height + header)
+        image = ImageOps.fit(
+            Image.open(catalog[(window["cam"], selected_id)]).convert("RGB"),
+            (cell_width, cell_height),
+            method=Image.Resampling.LANCZOS,
+        )
+        canvas.paste(image, (x, y + header))
+        draw.text(
+            (x + 10, y + 10),
+            f"frame {selected_id}",
+            fill=(20, 25, 28),
+            font=font(18),
+        )
+    canvas.save(output, quality=96)
+    return output
 
 
 class Qwen:
@@ -268,30 +372,37 @@ def assess_frame(
     qwen: Qwen,
     anchor: Mapping[str, Any],
     identity: Mapping[str, Any],
-    frame_path: Path,
+    context_strip_path: Path,
     cam: str,
     frame_id: int,
 ) -> dict[str, Any]:
     prompt = f"""
-Perform strict cross-view identity verification.
+Perform cross-view temporal object matching without inventing evidence.
 
-Image 1 contains ONLY the first-person source-mask pixels in their true RGB
-colors. Gray/black is artificial background.
-Image 2 is one third-person frame: camera={cam}, frame_id={frame_id}.
+Image 1 is the complete first-person source frame.
+Image 2 is a source context crop; its cyan box marks the binary-mask region and
+cyan is NOT an object color.
+Image 3 contains only the source-mask pixels in their original RGB colors;
+gray/black is artificial background.
+Image 4 contains previous, QUERY, and next third-person frames. Judge only the
+center QUERY frame ({cam}, frame_id={frame_id}); adjacent frames provide motion
+and handling context.
 
 Target identity description:
 {json.dumps(identity, ensure_ascii=False)}
 
-Decide whether the SAME target object is genuinely visible in Image 2. Scene
-activity, a person using another object, shared color, and generic object class
-are not sufficient. Use structure and distinguishing cues. If ambiguous,
-partially hidden beyond reliable recognition, or absent, set target_present to
-false. Do not claim a box unless target_present is true.
+Match the object indicated by the first-person binary mask, not merely its name.
+Use shape, parts, material, scale, how it is held/used, and temporal context.
+Do not demand impossible proof that two views show the same physical instance:
+"confirmed" means the visible object matches the source anchor with specific
+visual evidence; "possible" means plausible but partially hidden/small;
+"absent" means no matching object is visible. A missing/uncertain box must not
+change the presence decision.
 
 Return JSON only:
 {{
   "frame_id": {frame_id},
-  "target_present": false,
+  "presence": "confirmed|possible|absent",
   "bbox_xyxy_normalized": null,
   "visibility": 0.0,
   "occlusion": "none|low|medium|high",
@@ -299,20 +410,40 @@ Return JSON only:
   "visual_evidence": "brief frame-specific evidence"
 }}
 """
-    raw = qwen.ask([anchor["isolated_path"], frame_path], prompt)
+    raw = qwen.ask(
+        [
+            anchor["frame_path"],
+            anchor["context_path"],
+            anchor["isolated_path"],
+            context_strip_path,
+        ],
+        prompt,
+    )
     if not isinstance(raw, dict):
         raise ValueError("Frame response is not an object")
     confidence = max(
         0.0, min(1.0, float(raw.get("identity_confidence", 0.0)))
     )
-    present = bool(raw.get("target_present")) and confidence >= PRESENT_THRESHOLD
-    box = normalized_box(raw.get("bbox_xyxy_normalized")) if present else None
-    if box is None:
-        present = False
+    model_presence = str(raw.get("presence", "absent")).strip().lower()
+    if model_presence not in {"confirmed", "possible", "absent"}:
+        model_presence = "absent"
+    if model_presence == "confirmed":
+        evidence_score = confidence
+        target_present = confidence >= CONFIRMED_THRESHOLD
+    elif model_presence == "possible":
+        evidence_score = confidence * 0.72
+        target_present = confidence >= 0.70
+    else:
+        evidence_score = 0.0
+        target_present = False
+    box = normalized_box(raw.get("bbox_xyxy_normalized"))
     return {
+        "evidence_schema_version": EVIDENCE_SCHEMA_VERSION,
         "cam": cam,
         "frame_id": frame_id,
-        "target_present": present,
+        "model_presence": model_presence,
+        "target_present": target_present,
+        "evidence_score": round(evidence_score, 4),
         "bbox_xyxy_normalized": box,
         "visibility": max(
             0.0, min(1.0, float(raw.get("visibility", 0.0)))
@@ -320,13 +451,25 @@ Return JSON only:
         "occlusion": str(raw.get("occlusion", "high")),
         "identity_confidence": confidence,
         "visual_evidence": str(raw.get("visual_evidence", "")),
+        "raw_model_response": raw,
     }
+
+
+def is_supported(item: Mapping[str, Any]) -> bool:
+    return float(item.get("evidence_score", 0.0)) >= POSSIBLE_THRESHOLD
+
+
+def is_confirmed(item: Mapping[str, Any]) -> bool:
+    return (
+        item.get("model_presence") == "confirmed"
+        and float(item.get("identity_confidence", 0.0)) >= CONFIRMED_THRESHOLD
+    )
 
 
 def absent_run_max(items: list[dict[str, Any]]) -> int:
     maximum = current = 0
     for item in items:
-        if item["target_present"]:
+        if is_supported(item):
             current = 0
         else:
             current += 1
@@ -341,7 +484,7 @@ def occurrence_runs(
     current: list[dict[str, Any]] = []
     gap = 0
     for item in evidence:
-        if item["target_present"]:
+        if is_supported(item):
             if not current:
                 current = [item]
             else:
@@ -358,13 +501,13 @@ def occurrence_runs(
                 current = []
                 gap = 0
     if current:
-        while current and not current[-1]["target_present"]:
+        while current and not is_supported(current[-1]):
             current.pop()
         if current:
             runs.append(current)
     output = []
     for run in runs:
-        positives = [item for item in run if item["target_present"]]
+        positives = [item for item in run if is_supported(item)]
         if len(positives) < 2:
             continue
         output.append(
@@ -373,8 +516,11 @@ def occurrence_runs(
                 "first_confirmed_frame": positives[0]["frame_id"],
                 "last_confirmed_frame": positives[-1]["frame_id"],
                 "sampled_frame_count": len(run),
-                "confirmed_frame_count": len(positives),
-                "confirmed_fraction": len(positives) / len(run),
+                "supported_frame_count": len(positives),
+                "supported_fraction": len(positives) / len(run),
+                "strict_confirmed_frame_count": sum(
+                    1 for item in run if is_confirmed(item)
+                ),
             }
         )
     return output
@@ -394,7 +540,7 @@ def median_box(items: list[dict[str, Any]]) -> list[float] | None:
 def select_representatives(
     frame_items: list[dict[str, Any]], count: int = 5
 ) -> list[dict[str, Any]]:
-    present = [item for item in frame_items if item["target_present"]]
+    present = [item for item in frame_items if is_supported(item)]
     if not present:
         return []
     selected = []
@@ -410,6 +556,8 @@ def select_representatives(
             "visibility": item["visibility"],
             "occlusion": item["occlusion"],
             "identity_confidence": item["identity_confidence"],
+            "model_presence": item["model_presence"],
+            "evidence_score": item["evidence_score"],
         }
         for item in selected
     ]
@@ -418,43 +566,169 @@ def select_representatives(
 def score_window(
     window: Mapping[str, Any], frame_items: list[dict[str, Any]]
 ) -> dict[str, Any]:
-    present = [item for item in frame_items if item["target_present"]]
-    fraction = len(present) / max(1, len(frame_items))
+    supported = [item for item in frame_items if is_supported(item)]
+    confirmed = [item for item in frame_items if is_confirmed(item)]
+    support_fraction = len(supported) / max(1, len(frame_items))
+    confirmed_fraction = len(confirmed) / max(1, len(frame_items))
     visibility = statistics.mean(
-        [item["visibility"] for item in present] or [0.0]
+        [item["visibility"] for item in supported] or [0.0]
     )
     identity = statistics.mean(
-        [item["identity_confidence"] for item in present] or [0.0]
+        [item["identity_confidence"] for item in supported] or [0.0]
+    )
+    mean_evidence = statistics.mean(
+        [float(item.get("evidence_score", 0.0)) for item in frame_items]
     )
     longest_absence = absent_run_max(frame_items)
-    continuity = max(0.0, 1.0 - longest_absence / 4.0)
+    continuity = max(0.0, 1.0 - longest_absence / 6.0)
     endpoint_ok = bool(
         frame_items
-        and any(item["target_present"] for item in frame_items[:2])
-        and any(item["target_present"] for item in frame_items[-2:])
+        and any(is_supported(item) for item in frame_items[:3])
+        and any(is_supported(item) for item in frame_items[-3:])
     )
     overall = (
-        0.42 * fraction
-        + 0.23 * visibility
-        + 0.25 * identity
+        0.28 * support_fraction
+        + 0.16 * confirmed_fraction
+        + 0.20 * mean_evidence
+        + 0.14 * visibility
+        + 0.12 * identity
         + 0.10 * continuity
     )
     valid = (
         bool(window.get("continuity_ok"))
         and 0.20 <= float(window["requested_video_ratio"]) <= 0.30
-        and fraction >= WINDOW_PRESENT_FRACTION
+        and support_fraction >= WINDOW_SUPPORT_FRACTION
+        and confirmed_fraction >= WINDOW_CONFIRMED_FRACTION
         and longest_absence <= MAX_INTERNAL_ABSENT_RUN
         and endpoint_ok
     )
     return {
         "valid": valid,
-        "present_fraction": fraction,
+        "support_fraction": support_fraction,
+        "confirmed_fraction": confirmed_fraction,
         "longest_absent_run": longest_absence,
         "endpoint_evidence_ok": endpoint_ok,
         "mean_visibility": visibility,
         "mean_identity_confidence": identity,
+        "mean_evidence_score": mean_evidence,
         "overall": overall,
     }
+
+
+def verify_candidate_windows(
+    qwen: Qwen,
+    anchor: Mapping[str, Any],
+    identity: Mapping[str, Any],
+    temporal_index: Mapping[str, Any],
+    evidence: list[dict[str, Any]],
+    catalog: Mapping[tuple[str, int], Path],
+    work_case: Path,
+    force: bool,
+) -> dict[str, dict[str, Any]]:
+    """Ask Qwen to inspect the full temporal extent of top candidate windows."""
+    cache_path = work_case / "qwen_window_verifications.json"
+    cached: dict[str, dict[str, Any]] = {}
+    if cache_path.exists() and not force:
+        cached = read_json(cache_path)
+
+    evidence_map = {
+        (item["cam"], int(item["frame_id"])): item for item in evidence
+    }
+    ranked = []
+    for window in all_windows(temporal_index):
+        items = [
+            evidence_map[(window["cam"], int(frame_id))]
+            for frame_id in window["frame_ids"]
+        ]
+        ranked.append((window, score_window(window, items)))
+    ranked.sort(key=lambda entry: entry[1]["overall"], reverse=True)
+
+    # Avoid spending all verification calls on nearly identical overlapping windows.
+    selected: list[tuple[Mapping[str, Any], Mapping[str, Any]]] = []
+    for window, score in ranked:
+        if any(
+            window["cam"] == other["cam"]
+            and abs(int(window["start_frame"]) - int(other["start_frame"])) < 180
+            for other, _ in selected
+        ):
+            continue
+        selected.append((window, score))
+        if len(selected) >= MAX_WINDOWS_TO_VERIFY:
+            break
+
+    for position, (window, frame_score) in enumerate(selected, start=1):
+        window_id = str(window["window_id"])
+        if window_id in cached:
+            continue
+        print(
+            f"[window {position}/{len(selected)}] verify {window_id} "
+            f"{window['start_frame']}-{window['end_frame']}",
+            flush=True,
+        )
+        summary_path = make_window_summary(window, catalog, work_case)
+        prompt = f"""
+Evaluate one complete third-person candidate window against a first-person
+binary-mask identity anchor.
+
+Images 1-3 are the complete source frame, source context crop with a synthetic
+cyan marker, and original-RGB masked object. Image 4 is a 3x3 chronological
+summary spanning the ENTIRE candidate window {window_id}, frames
+{window['start_frame']}-{window['end_frame']}. The nine frame labels are real.
+
+Target identity:
+{json.dumps(identity, ensure_ascii=False)}
+
+Do not select a window because of one clear frame. Judge whether the target
+object is genuinely present through the beginning, middle, and end of this
+continuous window, allowing short occlusion but not long absence. Generic scene
+activity does not count. The frame-level pre-score is only a hint:
+{json.dumps(frame_score, ensure_ascii=False)}
+
+Return JSON only:
+{{
+  "window_id": "{window_id}",
+  "target_in_beginning": false,
+  "target_in_middle": false,
+  "target_in_end": false,
+  "estimated_coverage_fraction": 0.0,
+  "whole_window_suitable": false,
+  "identity_confidence": 0.0,
+  "reason": "evidence across the complete window"
+}}
+"""
+        raw = qwen.ask(
+            [
+                anchor["frame_path"],
+                anchor["context_path"],
+                anchor["isolated_path"],
+                summary_path,
+            ],
+            prompt,
+        )
+        if not isinstance(raw, dict):
+            raise ValueError(f"Window verification is not JSON: {window_id}")
+        coverage = max(
+            0.0,
+            min(1.0, float(raw.get("estimated_coverage_fraction", 0.0))),
+        )
+        confidence = max(
+            0.0, min(1.0, float(raw.get("identity_confidence", 0.0)))
+        )
+        cached[window_id] = {
+            "window_id": window_id,
+            "target_in_beginning": model_bool(raw.get("target_in_beginning")),
+            "target_in_middle": model_bool(raw.get("target_in_middle")),
+            "target_in_end": model_bool(raw.get("target_in_end")),
+            "estimated_coverage_fraction": coverage,
+            "whole_window_suitable": model_bool(
+                raw.get("whole_window_suitable")
+            ),
+            "identity_confidence": confidence,
+            "reason": str(raw.get("reason", "")),
+            "raw_model_response": raw,
+        }
+        write_json(cache_path, cached)
+    return cached
 
 
 def analyze_windows(
@@ -462,6 +736,7 @@ def analyze_windows(
     temporal_index: Mapping[str, Any],
     identity: Mapping[str, Any],
     evidence: list[dict[str, Any]],
+    window_verifications: Mapping[str, Mapping[str, Any]],
 ) -> dict[str, Any]:
     evidence_map = {
         (item["cam"], item["frame_id"]): item for item in evidence
@@ -474,6 +749,26 @@ def analyze_windows(
             for frame_id in window["frame_ids"]
         ]
         score = score_window(window, items)
+        verification = window_verifications.get(str(window["window_id"]))
+        verification_ok = bool(
+            verification
+            and verification.get("whole_window_suitable")
+            and float(verification.get("estimated_coverage_fraction", 0.0))
+            >= 0.50
+            and verification.get("target_in_beginning")
+            and verification.get("target_in_middle")
+            and verification.get("target_in_end")
+        )
+        score["window_verification"] = verification
+        score["window_verification_ok"] = verification_ok
+        if verification:
+            score["overall"] = (
+                0.72 * score["overall"]
+                + 0.18
+                * float(verification.get("estimated_coverage_fraction", 0.0))
+                + 0.10
+                * float(verification.get("identity_confidence", 0.0))
+            )
         inside_run = any(
             run["cam"] == window["cam"]
             and int(window["start_frame"]) >= run["first_confirmed_frame"]
@@ -481,7 +776,7 @@ def analyze_windows(
             for run in runs
         )
         score["inside_confirmed_occurrence"] = inside_run
-        score["valid"] = score["valid"] and inside_run
+        score["valid"] = score["valid"] and inside_run and verification_ok
         candidates.append((window, items, score))
 
     candidates.sort(key=lambda entry: entry[2]["overall"], reverse=True)
@@ -492,17 +787,45 @@ def analyze_windows(
     for window, _, score in candidates:
         if selected and window["window_id"] == selected[0]["window_id"]:
             continue
+        if selected:
+            selected_window = selected[0]
+            intersection = max(
+                0,
+                min(int(window["end_frame"]), int(selected_window["end_frame"]))
+                - max(
+                    int(window["start_frame"]),
+                    int(selected_window["start_frame"]),
+                ),
+            )
+            shorter_span = min(
+                int(window["end_frame"]) - int(window["start_frame"]),
+                int(selected_window["end_frame"])
+                - int(selected_window["start_frame"]),
+            )
+            if shorter_span and intersection / shorter_span > 0.35:
+                continue
+        elif any(
+            abs(int(window["start_frame"]) - int(item["start_frame"])) < 420
+            for item in rejected
+        ):
+            continue
         reason = []
         if not score["inside_confirmed_occurrence"]:
             reason.append("window is not fully inside a confirmed occurrence")
-        if score["present_fraction"] < WINDOW_PRESENT_FRACTION:
+        if score["support_fraction"] < WINDOW_SUPPORT_FRACTION:
             reason.append(
-                f"only {score['present_fraction']:.1%} sampled frames confirmed"
+                f"only {score['support_fraction']:.1%} sampled frames supported"
+            )
+        if score["confirmed_fraction"] < WINDOW_CONFIRMED_FRACTION:
+            reason.append(
+                f"only {score['confirmed_fraction']:.1%} sampled frames confirmed"
             )
         if score["longest_absent_run"] > MAX_INTERNAL_ABSENT_RUN:
             reason.append("absence gap is too long")
         if not score["endpoint_evidence_ok"]:
             reason.append("start/end evidence is insufficient")
+        if not score["window_verification_ok"]:
+            reason.append("whole-window visual verification did not pass")
         rejected.append(
             {
                 "window_id": window["window_id"],
@@ -518,7 +841,7 @@ def analyze_windows(
 
     source = metadata["source_best"]
     result: dict[str, Any] = {
-        "schema_version": 3,
+        "schema_version": 4,
         "case_id": metadata.get("case_id", ""),
         "target_object": metadata["target_object"],
         "source_best_view": source["view_name"],
@@ -531,10 +854,13 @@ def analyze_windows(
         "selection_constraints": {
             "window_ratio_min": 0.20,
             "window_ratio_max": 0.30,
-            "minimum_confirmed_sample_fraction": WINDOW_PRESENT_FRACTION,
+            "minimum_supported_sample_fraction": WINDOW_SUPPORT_FRACTION,
+            "minimum_confirmed_sample_fraction": WINDOW_CONFIRMED_FRACTION,
             "maximum_internal_absent_samples": MAX_INTERNAL_ABSENT_RUN,
             "window_must_be_inside_confirmed_occurrence": True,
+            "whole_window_qwen_verification_required": True,
         },
+        "window_verifications": window_verifications,
         "status": "success" if selected else "uncertain",
         "best_cam": selected[0]["cam"] if selected else None,
         "best_segment": None,
@@ -575,13 +901,15 @@ def analyze_windows(
             ),
         },
         "scores": {
-            "visibility_consistency": round(score["present_fraction"], 4),
+            "support_fraction": round(score["support_fraction"], 4),
+            "confirmed_fraction": round(score["confirmed_fraction"], 4),
             "identity_confidence": round(
                 score["mean_identity_confidence"], 4
             ),
             "temporal_stability": round(
-                1.0 - score["longest_absent_run"] / 4.0, 4
+                max(0.0, 1.0 - score["longest_absent_run"] / 6.0), 4
             ),
+            "whole_window_verification": score["window_verification"],
             "overall": round(score["overall"], 4),
         },
         "confidence": round(score["overall"], 4),
@@ -649,10 +977,10 @@ def draw_frame_panel(
         )
         draw.rectangle(box, outline=(0, 230, 170), width=5)
     frame_id = evidence.get("frame_id") if evidence else "?"
-    present = "present" if evidence and evidence["target_present"] else "absent"
+    presence = evidence.get("model_presence", "absent") if evidence else "absent"
     draw.rectangle((0, 0, 190, 27), fill=(15, 21, 25))
     draw.text(
-        (7, 5), f"frame {frame_id} | {present}", font=font(16), fill="white"
+        (7, 5), f"frame {frame_id} | {presence}", font=font(16), fill="white"
     )
     return panel
 
@@ -740,7 +1068,7 @@ def render_selected_contact_sheet(
     for cell in window["sheet_layout"]["cells"]:
         frame_id = int(cell["frame_id"])
         item = evidence_map[(window["cam"], frame_id)]
-        box = item.get("bbox_xyxy_normalized")
+        box = item.get("bbox_xyxy_normalized") if is_supported(item) else None
         if not box:
             continue
         left, top, right, bottom = cell["image_xyxy"]
@@ -753,6 +1081,28 @@ def render_selected_contact_sheet(
         )
         draw.rectangle(mapped, outline=(0, 230, 170), width=4)
     canvas.save(output, quality=96)
+    return output
+
+
+def timeline_bin_samples(
+    evidence: list[dict[str, Any]], count: int, highest: bool
+) -> list[dict[str, Any]]:
+    """Choose time-distributed evidence instead of falling back to first frames."""
+    ordered = sorted(evidence, key=lambda item: (item["cam"], item["frame_id"]))
+    if not ordered:
+        return []
+    output = []
+    for index in range(count):
+        start = math.floor(index * len(ordered) / count)
+        end = math.floor((index + 1) * len(ordered) / count)
+        bucket = ordered[start : max(start + 1, end)]
+        output.append(
+            max(bucket, key=lambda item: float(item.get("evidence_score", 0.0)))
+            if highest
+            else min(
+                bucket, key=lambda item: float(item.get("evidence_score", 0.0))
+            )
+        )
     return output
 
 
@@ -829,14 +1179,7 @@ def render_result(
             evidence_map[(window["cam"], int(frame_id))] for frame_id in ids
         ]
     else:
-        present = [item for item in evidence if item["target_present"]]
-        selected_items = present[:5]
-        if len(selected_items) < 5:
-            selected_items += [
-                item
-                for item in evidence
-                if item not in selected_items
-            ][: 5 - len(selected_items)]
+        selected_items = timeline_bin_samples(evidence, 5, highest=True)
 
     draw.text(
         (445, 180),
@@ -851,8 +1194,24 @@ def render_result(
         canvas.paste(panel, (x, 215))
 
     comparison = []
-    if result.get("rejected_segments"):
-        rejected_id = result["rejected_segments"][0]["window_id"]
+    meaningful_rejected = [
+        segment
+        for segment in result.get("rejected_segments", [])
+        if float(segment.get("scores", {}).get("overall", 0.0)) > 0.0
+    ]
+    if meaningful_rejected:
+        if best:
+            best_midpoint = (best["start_frame"] + best["end_frame"]) / 2
+            rejected_segment = max(
+                meaningful_rejected,
+                key=lambda segment: abs(
+                    (segment["start_frame"] + segment["end_frame"]) / 2
+                    - best_midpoint
+                ),
+            )
+        else:
+            rejected_segment = meaningful_rejected[0]
+        rejected_id = rejected_segment["window_id"]
         rejected_window = next(
             item
             for item in all_windows(temporal_index)
@@ -867,7 +1226,8 @@ def render_result(
             f"({rejected_window['start_frame']}-{rejected_window['end_frame']})"
         )
     else:
-        comparison_label = "COMPARISON: no additional generated window"
+        comparison = timeline_bin_samples(evidence, 5, highest=False)
+        comparison_label = "COMPARISON: lowest-evidence samples across full timeline"
     draw.text(
         (445, 435),
         comparison_label,
@@ -892,7 +1252,8 @@ def render_result(
     footer = [
         f"Confirmed occurrence spans: {run_text}",
         "Decision rule: full generated window must stay inside an occurrence span; "
-        "20%-30% ratio; >=75% confirmed samples; no absence gap >2 samples.",
+        "20%-30% ratio; >=60% supported and >=30% confirmed samples; "
+        "no absence gap >4 samples; whole-window verification required.",
         f"Uncertainty: {result.get('uncertainty') or 'none'}",
         "Cyan boxes are Qwen localization evidence, not masks. Overlay colors are never used as object colors.",
     ]
@@ -972,6 +1333,14 @@ def process_case(
         evidence = []
         if evidence_path.exists() and not force:
             evidence = read_json(evidence_path)
+            if evidence and any(
+                item.get("evidence_schema_version") != EVIDENCE_SCHEMA_VERSION
+                for item in evidence
+            ):
+                raise ValueError(
+                    "Cached frame evidence uses the obsolete schema. Use a new "
+                    "--work-dir or rerun with --force."
+                )
         completed = {
             (item["cam"], int(item["frame_id"])) for item in evidence
         }
@@ -983,19 +1352,36 @@ def process_case(
                 f"[{position}/{len(ordered)}] {cam} frame {frame_id}",
                 flush=True,
             )
+            context_strip = make_context_strip(
+                catalog, cam, frame_id, work_case
+            )
             item = assess_frame(
                 qwen,
                 anchor,
                 identity,
-                catalog[(cam, frame_id)],
+                context_strip,
                 cam,
                 frame_id,
             )
             evidence.append(item)
             evidence.sort(key=lambda value: (value["cam"], value["frame_id"]))
             write_json(evidence_path, evidence)
+        window_verifications = verify_candidate_windows(
+            qwen,
+            anchor,
+            identity,
+            temporal_index,
+            evidence,
+            catalog,
+            work_case,
+            force,
+        )
         result = analyze_windows(
-            anchor["metadata"], temporal_index, identity, evidence
+            anchor["metadata"],
+            temporal_index,
+            identity,
+            evidence,
+            window_verifications,
         )
         write_json(result_path, result)
 
