@@ -296,32 +296,56 @@ class Qwen:
         self.model.eval()
 
     def ask(self, images: list[Path], prompt: str) -> Any:
-        content: list[dict[str, Any]] = []
+        image_content: list[dict[str, Any]] = []
         for image_path in images:
-            content.append({"type": "image", "path": str(image_path.resolve())})
-        content.append({"type": "text", "text": prompt})
-        messages = [{"role": "user", "content": content}]
-        inputs = self.processor.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_dict=True,
-            return_tensors="pt",
-            enable_thinking=False,
-        )
-        inputs = inputs.to(self.model.device)
-        with self.torch.inference_mode():
-            generated = self.model.generate(
-                **inputs,
-                max_new_tokens=self.max_new_tokens,
-                do_sample=False,
-                use_cache=True,
+            image_content.append(
+                {"type": "image", "path": str(image_path.resolve())}
             )
-        generated = generated[:, inputs["input_ids"].shape[1] :]
-        output = self.processor.batch_decode(
-            generated, skip_special_tokens=True
-        )[0]
-        return parse_model_json(output)
+        last_output = ""
+        for attempt in range(2):
+            attempt_prompt = prompt
+            if attempt:
+                attempt_prompt += (
+                    "\nCRITICAL RETRY: Return one complete minified JSON object "
+                    "only. No markdown fence. Every string value must be at "
+                    "most 18 words. Do not explain outside JSON."
+                )
+                print("Retrying truncated or invalid model JSON...", flush=True)
+            content = [*image_content, {"type": "text", "text": attempt_prompt}]
+            messages = [{"role": "user", "content": content}]
+            inputs = self.processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=True,
+                return_tensors="pt",
+                enable_thinking=False,
+            )
+            inputs = inputs.to(self.model.device)
+            with self.torch.inference_mode():
+                generated = self.model.generate(
+                    **inputs,
+                    max_new_tokens=(
+                        self.max_new_tokens
+                        if attempt == 0
+                        else max(512, self.max_new_tokens)
+                    ),
+                    do_sample=False,
+                    use_cache=True,
+                )
+            generated = generated[:, inputs["input_ids"].shape[1] :]
+            last_output = self.processor.batch_decode(
+                generated, skip_special_tokens=True
+            )[0]
+            try:
+                return parse_model_json(last_output)
+            except ValueError:
+                if attempt == 0:
+                    continue
+        raise ValueError(
+            "No valid JSON found after one concise retry: "
+            f"{last_output[:1000]}"
+        )
 
 
 def identify_source(qwen: Qwen, anchor: Mapping[str, Any]) -> dict[str, Any]:
@@ -407,7 +431,7 @@ Return JSON only:
   "visibility": 0.0,
   "occlusion": "none|low|medium|high",
   "identity_confidence": 0.0,
-  "visual_evidence": "brief frame-specific evidence"
+  "visual_evidence": "maximum 18 words of frame-specific evidence"
 }}
 """
     raw = qwen.ask(
@@ -693,7 +717,7 @@ Return JSON only:
   "estimated_coverage_fraction": 0.0,
   "whole_window_suitable": false,
   "identity_confidence": 0.0,
-  "reason": "evidence across the complete window"
+  "reason": "maximum 18 words about evidence across the complete window"
 }}
 """
         raw = qwen.ask(
