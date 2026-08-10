@@ -69,3 +69,49 @@ python qwen_temporal_runner.py \
   --work-dir "/scratch/users/ntu/gwang016/qwen35-4b/temporal_batch6_work_v2" \
   --render-only
 ```
+
+## Generate an easier comparison batch
+
+The temporal asset generator can create camera-relative windows whose lengths
+are 20%, 25%, and 30% of each complete target camera. For example:
+
+```bash
+cd "$HOME/worldmodel/sam3"
+DATA="/scratch/users/ntu/$USER/datasets/Ego-Exo4D-Relation-Test/extracted/work/yuqian_fu/Ego/data_segswap_test"
+EASY6="/scratch/users/ntu/$USER/temporal_cross_view_assets_ratio_easy6"
+
+"$HOME/.conda/envs/sam3/bin/python" generate_temporal_cross_view_assets.py \
+  --data-root "$DATA" \
+  --output-root "$EASY6" \
+  --case-id 0a22a1c1-844c-4f62-8eeb-f16eee62357f__CPR_dummy \
+  --case-id 0a3868ef-fdba-4aba-bc02-5028d1ed26f4__bicycle_inner_tube_0 \
+  --case-id 0b82763e-b9ee-40e5-8dd5-b8da7e862662__ketchup_bottle_0 \
+  --case-id 0bacb5bb-591d-4756-a2cf-ed90793e65bb__white_mug_0 \
+  --case-id 0099226c-9bec-44aa-ba43-2b90eb7b8379__sugar_container_0 \
+  --case-id 0099226c-9bec-44aa-ba43-2b90eb7b8379__yellow_tea_strainer_0 \
+  --window-ratios 0.20 0.25 0.30 \
+  --window-stride-ratio 0.05 \
+  --sheet-columns 6 \
+  --cell-width 480 \
+  --cell-height 330 \
+  --overwrite
+```
+
+Verify that exactly six cases and ratio windows were generated before using a
+GPU:
+
+```bash
+find "$EASY6" -mindepth 1 -maxdepth 1 -type d | sort
+for f in "$EASY6"/*/temporal_window_index.json; do
+  jq -e '.windowing.mode == "camera_relative_ratio" and
+         ([.windowing.window_ratios[]] == [0.2, 0.25, 0.3])' "$f"
+done
+```
+
+Submit the same runner with isolated assets and cache paths:
+
+```bash
+cd "$HOME/worldmodel/sam3/temporal_cross_view_assets_ratio_batch6"
+qsub -v ASSETS="$EASY6",WORK_DIR="/scratch/users/ntu/$USER/qwen35-4b/temporal_easy6_work" \
+  run_qwen_temporal_batch.pbs
+```

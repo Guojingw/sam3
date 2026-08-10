@@ -86,6 +86,25 @@ def parse_args() -> argparse.Namespace:
         help="Number of sampled target frames per window; e.g. 10 16 20.",
     )
     parser.add_argument(
+        "--window-ratios",
+        type=float,
+        nargs="+",
+        default=[],
+        help=(
+            "Generate windows as fractions of each complete target camera "
+            "sequence; e.g. 0.20 0.25 0.30. Overrides --window-sizes."
+        ),
+    )
+    parser.add_argument(
+        "--window-stride-ratio",
+        type=float,
+        default=0.05,
+        help=(
+            "Stride as a fraction of the complete sampled target camera "
+            "sequence when --window-ratios is used."
+        ),
+    )
+    parser.add_argument(
         "--window-stride",
         type=int,
         default=8,
@@ -635,6 +654,8 @@ def generate_target_windows(
     target_prefix: str,
     window_sizes: Sequence[int],
     window_stride: int,
+    window_ratios: Sequence[float],
+    window_stride_ratio: float,
     target_sample_every: int,
     max_gap_factor: float,
     max_windows_per_cam: int,
@@ -650,13 +671,22 @@ def generate_target_windows(
         if path.is_dir() and path.name.startswith(target_prefix)
     )
     warnings: List[str] = []
+    ratio_mode = bool(window_ratios)
     index: Dict[str, Any] = {
         "windowing": {
-            "window_sizes": list(window_sizes),
-            "window_stride_sampled_frames": window_stride,
+            "mode": "camera_relative_ratio" if ratio_mode else "fixed_sample_count",
+            "window_sizes": [] if ratio_mode else list(window_sizes),
+            "window_ratios": list(window_ratios),
+            "window_stride_sampled_frames": None if ratio_mode else window_stride,
+            "window_stride_ratio": window_stride_ratio if ratio_mode else None,
             "target_sample_every_available_images": target_sample_every,
             "max_gap_factor": max_gap_factor,
             "max_windows_per_cam": max_windows_per_cam,
+            "ratio_denominator": (
+                "number of available sampled frames in the complete camera"
+                if ratio_mode
+                else None
+            ),
         },
         "cameras": {},
     }
@@ -678,11 +708,32 @@ def generate_target_windows(
         )
         runs = split_contiguous_runs(sampled_frames, max_gap)
 
-        candidate_windows: List[Tuple[int, List[FrameImage], int]] = []
+        if ratio_mode:
+            effective_specs = [
+                (
+                    max(2, round(len(sampled_frames) * ratio)),
+                    ratio,
+                )
+                for ratio in sorted(set(window_ratios))
+            ]
+            effective_stride = max(
+                1, round(len(sampled_frames) * window_stride_ratio)
+            )
+        else:
+            effective_specs = [
+                (window_size, None) for window_size in sorted(set(window_sizes))
+            ]
+            effective_stride = window_stride
+
+        candidate_windows: List[
+            Tuple[int, List[FrameImage], int, Optional[float]]
+        ] = []
         for run_index, run in enumerate(runs):
-            for window_size in sorted(set(window_sizes)):
-                for window in sliding_windows(run, window_size, window_stride):
-                    candidate_windows.append((run_index, window, window_size))
+            for window_size, requested_ratio in effective_specs:
+                for window in sliding_windows(run, window_size, effective_stride):
+                    candidate_windows.append(
+                        (run_index, window, window_size, requested_ratio)
+                    )
         candidate_windows.sort(
             key=lambda item: (
                 item[1][0].frame_id,
@@ -697,13 +748,21 @@ def generate_target_windows(
         camera_windows: List[Dict[str, Any]] = []
         camera_out = case_dir / "target_temporal_windows" / target_dir.name
         camera_out.mkdir(parents=True, exist_ok=True)
-        for window_index, (run_index, window, window_size) in enumerate(
+        for window_index, (
+            run_index,
+            window,
+            window_size,
+            requested_ratio,
+        ) in enumerate(
             candidate_windows
         ):
             frame_ids = [frame.frame_id for frame in window]
             gaps = [b - a for a, b in zip(frame_ids, frame_ids[1:])]
+            ratio_label = (
+                f"_ratio_{requested_ratio:.2f}" if requested_ratio is not None else ""
+            )
             filename = (
-                f"window_{window_index:04d}_frames_"
+                f"window_{window_index:04d}{ratio_label}_frames_"
                 f"{frame_ids[0]}_{frame_ids[-1]}.jpg"
             )
             relative_sheet_path = (
@@ -718,8 +777,7 @@ def generate_target_windows(
                 header_height=header_height,
                 jpeg_quality=jpeg_quality,
             )
-            camera_windows.append(
-                {
+            window_record: Dict[str, Any] = {
                     "window_id": f"{target_dir.name}_window_{window_index:04d}",
                     "cam": target_dir.name,
                     "run_index": run_index,
@@ -742,12 +800,34 @@ def generate_target_windows(
                     ),
                     "contact_sheet": str(relative_sheet_path),
                     "sheet_layout": layout,
-                }
-            )
+            }
+            if requested_ratio is not None:
+                video_span = full_ids[-1] - full_ids[0] if len(full_ids) > 1 else 0
+                actual_sampled_ratio = window_size / len(sampled_frames)
+                window_record.update(
+                    {
+                        "requested_video_ratio": requested_ratio,
+                        "actual_sampled_frame_ratio": actual_sampled_ratio,
+                        "actual_frame_span_ratio": (
+                            (frame_ids[-1] - frame_ids[0]) / video_span
+                            if video_span > 0
+                            else 0.0
+                        ),
+                        "ratio_error_sampled_frames": (
+                            actual_sampled_ratio - requested_ratio
+                        ),
+                    }
+                )
+            camera_windows.append(window_record)
 
-        index["cameras"][target_dir.name] = {
+        camera_record: Dict[str, Any] = {
             "source_frame_count": len(all_frames),
             "sampled_frame_count": len(sampled_frames),
+            "video_start_frame": full_ids[0] if full_ids else None,
+            "video_end_frame": full_ids[-1] if full_ids else None,
+            "video_frame_span": (
+                full_ids[-1] - full_ids[0] if len(full_ids) > 1 else 0
+            ),
             "full_median_frame_gap": full_step,
             "sampled_median_frame_gap": sampled_step,
             "continuity_split_threshold": max_gap,
@@ -755,6 +835,24 @@ def generate_target_windows(
             "window_count": len(camera_windows),
             "windows": camera_windows,
         }
+        if ratio_mode:
+            camera_record.update(
+                {
+                    "requested_window_ratios": list(sorted(set(window_ratios))),
+                    "effective_window_specs": [
+                        {
+                            "window_size_sampled_frames": size,
+                            "requested_video_ratio": ratio,
+                            "actual_sampled_frame_ratio": (
+                                size / len(sampled_frames) if sampled_frames else 0.0
+                            ),
+                        }
+                        for size, ratio in effective_specs
+                    ],
+                    "effective_window_stride_sampled_frames": effective_stride,
+                }
+            )
+        index["cameras"][target_dir.name] = camera_record
 
     if not target_dirs:
         warnings.append(
@@ -902,6 +1000,8 @@ def process_case(case: CaseSpec, args: argparse.Namespace) -> Dict[str, Any]:
         target_prefix=args.target_prefix,
         window_sizes=args.window_sizes,
         window_stride=args.window_stride,
+        window_ratios=args.window_ratios,
+        window_stride_ratio=args.window_stride_ratio,
         target_sample_every=args.target_sample_every,
         max_gap_factor=args.max_gap_factor,
         max_windows_per_cam=args.max_windows_per_cam,
@@ -977,6 +1077,10 @@ def validate_args(args: argparse.Namespace) -> None:
         )
     if any(size <= 1 for size in args.window_sizes):
         raise SystemExit("Every window size must be at least 2.")
+    if any(ratio <= 0 or ratio > 1 for ratio in args.window_ratios):
+        raise SystemExit("Every window ratio must be greater than 0 and at most 1.")
+    if args.window_stride_ratio <= 0 or args.window_stride_ratio > 1:
+        raise SystemExit("Window stride ratio must be greater than 0 and at most 1.")
     if args.window_stride <= 0 or args.target_sample_every <= 0:
         raise SystemExit(
             "Window stride and target sample interval must be positive."

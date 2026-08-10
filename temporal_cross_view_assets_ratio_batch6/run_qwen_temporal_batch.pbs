@@ -9,23 +9,26 @@
 set -euo pipefail
 
 REPO="$HOME/worldmodel/sam3"
-ASSETS="$REPO/temporal_cross_view_assets_ratio_batch6"
+RUNNER_DIR="$REPO/temporal_cross_view_assets_ratio_batch6"
+ASSETS="${ASSETS:-$RUNNER_DIR}"
 SCRATCH="/scratch/users/ntu/$USER"
 PYTHON="$HOME/.conda/envs/sam3/bin/python"
 MODEL_DIR="$SCRATCH/qwen35-4b/model"
-WORK_DIR="$SCRATCH/qwen35-4b/temporal_batch6_work_v2"
+WORK_DIR="${WORK_DIR:-$SCRATCH/qwen35-4b/temporal_batch6_work_v2}"
 
-cd "$ASSETS"
+cd "$RUNNER_DIR"
 
 echo "host=$(hostname)"
 echo "job_id=${PBS_JOBID:-unknown}"
 echo "python=$PYTHON"
 echo "model=$MODEL_DIR"
+echo "assets=$ASSETS"
+echo "work_dir=$WORK_DIR"
 test -x "$PYTHON"
 test -f "$MODEL_DIR/config.json"
 nvidia-smi
 
-"$PYTHON" qwen_temporal_runner.py \
+"$PYTHON" "$RUNNER_DIR/qwen_temporal_runner.py" \
   --assets-root "$ASSETS" \
   --model "$MODEL_DIR" \
   --work-dir "$WORK_DIR"
