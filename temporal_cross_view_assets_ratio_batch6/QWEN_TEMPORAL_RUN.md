@@ -14,18 +14,18 @@ Qwen3.5 with 4B parameters; it does not mean a 3.5B model.
 4. Ask Qwen for `confirmed`, `possible`, or `absent` evidence on every query
    frame. Presence and bounding-box validity are evaluated independently.
 5. Build independent occurrence spans for each case.
-6. Recheck the strongest candidate windows with a chronological 3x3 summary
-   spanning each complete window.
-7. Deterministically reject any candidate window that:
-   - is not fully inside a confirmed occurrence span;
-   - is not a generated 20%-30% window;
-   - supports the target in fewer than 60% of sampled frames;
-   - confirms the target in fewer than 30% of sampled frames;
-   - has more than four consecutive absent samples;
-   - lacks evidence near either endpoint; or
-   - fails Qwen's beginning/middle/end whole-window verification.
-8. Select the highest whole-window score or emit `uncertain`.
-9. Rewrite `temporal_analysis_result.json`, render the comparison image, and
+6. Use the largest source-mask frame as a weak same-take timing prior, then
+   recheck the strongest candidate windows with a chronological 3x3 summary.
+7. Prefer a generated 20% continuous window that captures the most evidence
+   from a localized occurrence. The target may be absent in surrounding window
+   context when its true occurrence is shorter than 20% of the video.
+8. Deterministically reject a window unless it captures at least two supported
+   localized samples, including one confirmed sample, and Qwen verifies that
+   the summary contains the identity-matching occurrence. A one-frame ambiguous
+   glimpse is insufficient.
+9. Select the strongest verified occurrence-containing window or emit
+   `uncertain`.
+10. Rewrite `temporal_analysis_result.json`, render the comparison image, and
    update `batch_temporal_analysis_summary.json`.
 
 ## NSCC commands

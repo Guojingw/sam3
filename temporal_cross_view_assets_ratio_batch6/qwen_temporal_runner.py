@@ -21,6 +21,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 CASE_GLOB = "*__*"
 EVIDENCE_SCHEMA_VERSION = 3
+WINDOW_VERIFICATION_SCHEMA_VERSION = 2
 CONFIRMED_THRESHOLD = 0.50
 POSSIBLE_THRESHOLD = 0.45
 WINDOW_SUPPORT_FRACTION = 0.60
@@ -669,6 +670,63 @@ def source_frame_proximity(
     return max(0.0, 1.0 - abs(midpoint - source_frame) / video_span)
 
 
+def occurrence_capture(
+    window: Mapping[str, Any],
+    runs: list[dict[str, Any]],
+    evidence: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Measure how much of the strongest occurrence a candidate contains."""
+    best = {
+        "overlaps_occurrence": False,
+        "occurrence_first_frame": None,
+        "occurrence_last_frame": None,
+        "occurrence_supported_count": 0,
+        "captured_supported_count": 0,
+        "captured_confirmed_count": 0,
+        "captured_occurrence_fraction": 0.0,
+    }
+    for run in runs:
+        if run["cam"] != window["cam"]:
+            continue
+        run_items = [
+            item
+            for item in evidence
+            if item["cam"] == run["cam"]
+            and int(run["first_confirmed_frame"])
+            <= int(item["frame_id"])
+            <= int(run["last_confirmed_frame"])
+            and is_supported(item)
+        ]
+        captured = [
+            item
+            for item in run_items
+            if int(window["start_frame"])
+            <= int(item["frame_id"])
+            <= int(window["end_frame"])
+        ]
+        fraction = len(captured) / max(1, len(run_items))
+        candidate = {
+            "overlaps_occurrence": len(captured) >= 2,
+            "occurrence_first_frame": run["first_confirmed_frame"],
+            "occurrence_last_frame": run["last_confirmed_frame"],
+            "occurrence_supported_count": len(run_items),
+            "captured_supported_count": len(captured),
+            "captured_confirmed_count": sum(
+                1 for item in captured if is_confirmed(item)
+            ),
+            "captured_occurrence_fraction": fraction,
+        }
+        if (
+            candidate["captured_supported_count"],
+            candidate["captured_occurrence_fraction"],
+        ) > (
+            best["captured_supported_count"],
+            best["captured_occurrence_fraction"],
+        ):
+            best = candidate
+    return best
+
+
 def verify_candidate_windows(
     qwen: Qwen,
     anchor: Mapping[str, Any],
@@ -684,6 +742,17 @@ def verify_candidate_windows(
     cached: dict[str, dict[str, Any]] = {}
     if cache_path.exists() and not force:
         cached = read_json(cache_path)
+        if cached and any(
+            item.get("verification_schema_version")
+            != WINDOW_VERIFICATION_SCHEMA_VERSION
+            for item in cached.values()
+        ):
+            print(
+                "Cached window verification uses an obsolete schema; "
+                "recomputing this case.",
+                flush=True,
+            )
+            cached = {}
 
     evidence_map = {
         (item["cam"], int(item["frame_id"])): item for item in evidence
@@ -746,10 +815,11 @@ The largest first-person source mask occurs at frame {source_frame} in the
 same take. Treat proximity to that frame only as a weak timing prior. It is not
 proof of third-person visibility and must not override the window images.
 
-Do not select a window because of one clear frame. Judge whether the target
-object is genuinely present through the beginning, middle, and end of this
-continuous window, allowing short occlusion but not long absence. Generic scene
-activity does not count. The frame-level pre-score is only a hint:
+The target does NOT need to remain visible throughout the complete window.
+Judge whether this window contains a genuine, identity-matching occurrence in
+at least two nearby summary positions. Generic scene activity and one isolated
+ambiguous glimpse do not count. Report where in the window it appears. The
+frame-level pre-score is only a hint:
 {json.dumps(frame_score, ensure_ascii=False)}
 
 Return JSON only:
@@ -758,10 +828,10 @@ Return JSON only:
   "target_in_beginning": false,
   "target_in_middle": false,
   "target_in_end": false,
-  "estimated_coverage_fraction": 0.0,
-  "whole_window_suitable": false,
+  "contains_target_occurrence": false,
+  "visible_summary_position_count": 0,
   "identity_confidence": 0.0,
-  "reason": "maximum 18 words about evidence across the complete window"
+  "reason": "maximum 18 words about the localized occurrence"
 }}
 """
         raw = qwen.ask(
@@ -775,21 +845,20 @@ Return JSON only:
         )
         if not isinstance(raw, dict):
             raise ValueError(f"Window verification is not JSON: {window_id}")
-        coverage = max(
-            0.0,
-            min(1.0, float(raw.get("estimated_coverage_fraction", 0.0))),
-        )
         confidence = max(
             0.0, min(1.0, float(raw.get("identity_confidence", 0.0)))
         )
         cached[window_id] = {
+            "verification_schema_version": WINDOW_VERIFICATION_SCHEMA_VERSION,
             "window_id": window_id,
             "target_in_beginning": model_bool(raw.get("target_in_beginning")),
             "target_in_middle": model_bool(raw.get("target_in_middle")),
             "target_in_end": model_bool(raw.get("target_in_end")),
-            "estimated_coverage_fraction": coverage,
-            "whole_window_suitable": model_bool(
-                raw.get("whole_window_suitable")
+            "contains_target_occurrence": model_bool(
+                raw.get("contains_target_occurrence")
+            ),
+            "visible_summary_position_count": max(
+                0, min(9, int(raw.get("visible_summary_position_count", 0)))
             ),
             "identity_confidence": confidence,
             "reason": str(raw.get("reason", "")),
@@ -821,38 +890,44 @@ def analyze_windows(
         score["source_frame_temporal_prior"] = source_frame_proximity(
             window, temporal_index, source_frame
         )
+        capture = occurrence_capture(window, runs, evidence)
+        score.update(capture)
         verification = window_verifications.get(str(window["window_id"]))
         verification_ok = bool(
             verification
-            and verification.get("whole_window_suitable")
-            and float(verification.get("estimated_coverage_fraction", 0.0))
-            >= 0.50
-            and verification.get("target_in_beginning")
-            and verification.get("target_in_middle")
-            and verification.get("target_in_end")
+            and verification.get("contains_target_occurrence")
+            and int(verification.get("visible_summary_position_count", 0)) >= 2
+            and float(verification.get("identity_confidence", 0.0))
+            >= CONFIRMED_THRESHOLD
         )
         score["window_verification"] = verification
         score["window_verification_ok"] = verification_ok
         if verification:
             score["overall"] = (
-                0.72 * score["overall"]
-                + 0.18
-                * float(verification.get("estimated_coverage_fraction", 0.0))
-                + 0.10
+                0.80 * score["overall"]
+                + 0.20
                 * float(verification.get("identity_confidence", 0.0))
             )
-        inside_run = any(
-            run["cam"] == window["cam"]
-            and int(window["start_frame"]) >= run["first_confirmed_frame"]
-            and int(window["end_frame"]) <= run["last_confirmed_frame"]
-            for run in runs
+        score["valid"] = bool(
+            window.get("continuity_ok")
+            and 0.20 <= float(window["requested_video_ratio"]) <= 0.30
+            and score["overlaps_occurrence"]
+            and score["captured_supported_count"] >= 2
+            and score["captured_confirmed_count"] >= 1
+            and verification_ok
         )
-        score["inside_confirmed_occurrence"] = inside_run
-        score["valid"] = score["valid"] and inside_run and verification_ok
         candidates.append((window, items, score))
 
     candidates.sort(
         key=lambda entry: (
+            -abs(float(entry[0]["requested_video_ratio"]) - 0.20),
+            entry[2]["captured_supported_count"],
+            entry[2]["captured_occurrence_fraction"],
+            float(
+                (entry[2].get("window_verification") or {}).get(
+                    "identity_confidence", 0.0
+                )
+            ),
             entry[2]["overall"],
             entry[2]["source_frame_temporal_prior"],
         ),
@@ -888,22 +963,12 @@ def analyze_windows(
         ):
             continue
         reason = []
-        if not score["inside_confirmed_occurrence"]:
-            reason.append("window is not fully inside a confirmed occurrence")
-        if score["support_fraction"] < WINDOW_SUPPORT_FRACTION:
-            reason.append(
-                f"only {score['support_fraction']:.1%} sampled frames supported"
-            )
-        if score["confirmed_fraction"] < WINDOW_CONFIRMED_FRACTION:
-            reason.append(
-                f"only {score['confirmed_fraction']:.1%} sampled frames confirmed"
-            )
-        if score["longest_absent_run"] > MAX_INTERNAL_ABSENT_RUN:
-            reason.append("absence gap is too long")
-        if not score["endpoint_evidence_ok"]:
-            reason.append("start/end evidence is insufficient")
+        if not score["overlaps_occurrence"]:
+            reason.append("window does not capture two supported occurrence frames")
+        if score["captured_confirmed_count"] < 1:
+            reason.append("window has no confirmed localized occurrence frame")
         if not score["window_verification_ok"]:
-            reason.append("whole-window visual verification did not pass")
+            reason.append("occurrence verification did not pass")
         rejected.append(
             {
                 "window_id": window["window_id"],
@@ -919,7 +984,7 @@ def analyze_windows(
 
     source = metadata["source_best"]
     result: dict[str, Any] = {
-        "schema_version": 4,
+        "schema_version": 5,
         "case_id": metadata.get("case_id", ""),
         "target_object": metadata["target_object"],
         "source_best_view": source["view_name"],
@@ -936,11 +1001,12 @@ def analyze_windows(
         "selection_constraints": {
             "window_ratio_min": 0.20,
             "window_ratio_max": 0.30,
-            "minimum_supported_sample_fraction": WINDOW_SUPPORT_FRACTION,
-            "minimum_confirmed_sample_fraction": WINDOW_CONFIRMED_FRACTION,
-            "maximum_internal_absent_samples": MAX_INTERNAL_ABSENT_RUN,
-            "window_must_be_inside_confirmed_occurrence": True,
-            "whole_window_qwen_verification_required": True,
+            "preferred_window_ratio": 0.20,
+            "minimum_captured_supported_frames": 2,
+            "minimum_captured_confirmed_frames": 1,
+            "window_must_overlap_confirmed_occurrence": True,
+            "target_may_be_absent_in_window_context": True,
+            "occurrence_qwen_verification_required": True,
         },
         "window_verifications": window_verifications,
         "status": "success" if selected else "uncertain",
@@ -953,9 +1019,8 @@ def analyze_windows(
     }
     if not selected:
         result["uncertainty"] = (
-            "No generated 20%-30% continuous window is fully contained in a "
-            "confirmed target occurrence while satisfying whole-window "
-            "visibility and continuity requirements."
+            "No generated 20%-30% continuous window contains at least two "
+            "localized occurrence samples and passes occurrence verification."
         )
         result["confidence"] = round(
             max((entry[2]["overall"] for entry in candidates), default=0.0), 4
@@ -973,6 +1038,17 @@ def analyze_windows(
         "requested_video_ratio": window["requested_video_ratio"],
         "actual_sampled_frame_ratio": window["actual_sampled_frame_ratio"],
         "actual_frame_span_ratio": window["actual_frame_span_ratio"],
+        "captured_occurrence": {
+            key: score[key]
+            for key in (
+                "occurrence_first_frame",
+                "occurrence_last_frame",
+                "occurrence_supported_count",
+                "captured_supported_count",
+                "captured_confirmed_count",
+                "captured_occurrence_fraction",
+            )
+        },
         "representative_frames": select_representatives(items),
         "target_region_summary": {
             "coordinate_system": "normalized_xyxy_per_frame",
@@ -991,13 +1067,13 @@ def analyze_windows(
             "temporal_stability": round(
                 max(0.0, 1.0 - score["longest_absent_run"] / 6.0), 4
             ),
-            "whole_window_verification": score["window_verification"],
+            "occurrence_verification": score["window_verification"],
             "overall": round(score["overall"], 4),
         },
         "confidence": round(score["overall"], 4),
         "reason_selected": (
-            "The complete window is inside a Qwen-confirmed occurrence span "
-            "and passes ratio, endpoint, visibility, and continuity checks."
+            "Preferred 20% continuous window captures the strongest localized "
+            "occurrence and passes identity verification."
         ),
         "recommended_sam_prompt": (
             f"Segment the {identity.get('object_identity', metadata['target_object'])} "
@@ -1019,7 +1095,7 @@ def analyze_windows(
                     "actual_frame_span_ratio"
                 ],
                 "reason": (
-                    f"Valid but lower whole-window score "
+                    f"Valid but lower occurrence-capture score "
                     f"({score_alt['overall']:.3f})."
                 ),
             }
@@ -1338,9 +1414,9 @@ def render_result(
     )
     footer = [
         f"Confirmed occurrence spans: {run_text}",
-        "Decision rule: full generated window must stay inside an occurrence span; "
-        "20%-30% ratio; >=60% supported and >=30% confirmed samples; "
-        "no absence gap >4 samples; whole-window verification required.",
+        "Decision rule: prefer a continuous 20% window that captures the most "
+        "localized occurrence evidence; target may be absent in surrounding "
+        "context; at least two supported and one confirmed sample required.",
         f"Uncertainty: {result.get('uncertainty') or 'none'}",
         "Cyan boxes are Qwen localization evidence, not masks. Overlay colors are never used as object colors.",
     ]

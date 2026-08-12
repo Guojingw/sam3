@@ -56,10 +56,14 @@ class TemporalSelectionTests(unittest.TestCase):
                 evidence_map[(window["cam"], frame_id)]
                 for frame_id in window["frame_ids"]
             ]
-            if runner.score_window(window, items)["support_fraction"] == 1.0:
+            supported = sum(runner.is_supported(item) for item in items)
+            if supported >= 2:
                 output[window["window_id"]] = {
-                    "whole_window_suitable": True,
-                    "estimated_coverage_fraction": 1.0,
+                    "verification_schema_version": (
+                        runner.WINDOW_VERIFICATION_SCHEMA_VERSION
+                    ),
+                    "contains_target_occurrence": True,
+                    "visible_summary_position_count": min(9, supported),
                     "identity_confidence": 0.9,
                     "target_in_beginning": True,
                     "target_in_middle": True,
@@ -82,8 +86,26 @@ class TemporalSelectionTests(unittest.TestCase):
         self.assertGreaterEqual(best["start_frame"], 1200)
         self.assertLessEqual(best["end_frame"], 2400)
 
-    def test_short_occurrence_remains_uncertain(self) -> None:
+    def test_short_occurrence_selects_nearest_twenty_percent_window(self) -> None:
         evidence = synthetic_evidence(1200, 1800)
+        result = runner.analyze_windows(
+            self.metadata,
+            self.index,
+            self.identity,
+            evidence,
+            self.verifications(evidence),
+        )
+        self.assertEqual(result["status"], "success")
+        best = result["best_segment"]
+        self.assertEqual(best["requested_video_ratio"], 0.20)
+        self.assertLessEqual(best["start_frame"], 1200)
+        self.assertGreaterEqual(best["end_frame"], 1800)
+        self.assertEqual(
+            best["captured_occurrence"]["captured_occurrence_fraction"], 1.0
+        )
+
+    def test_single_frame_glimpse_remains_uncertain(self) -> None:
+        evidence = synthetic_evidence(1200, 1200)
         result = runner.analyze_windows(
             self.metadata,
             self.index,
