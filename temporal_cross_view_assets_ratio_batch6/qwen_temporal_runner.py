@@ -19,8 +19,8 @@ from typing import Any, Iterable, Mapping
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 
-CASE_GLOB = "*__*_0"
-EVIDENCE_SCHEMA_VERSION = 2
+CASE_GLOB = "*__*"
+EVIDENCE_SCHEMA_VERSION = 3
 CONFIRMED_THRESHOLD = 0.50
 POSSIBLE_THRESHOLD = 0.45
 WINDOW_SUPPORT_FRACTION = 0.60
@@ -419,9 +419,11 @@ Match the object indicated by the first-person binary mask, not merely its name.
 Use shape, parts, material, scale, how it is held/used, and temporal context.
 Do not demand impossible proof that two views show the same physical instance:
 "confirmed" means the visible object matches the source anchor with specific
-visual evidence; "possible" means plausible but partially hidden/small;
-"absent" means no matching object is visible. A missing/uncertain box must not
-change the presence decision.
+visual evidence and a valid localization box; "possible" means plausible but
+partially hidden/small and still requires a localization box; "absent" means
+no matching object is visible. Use null bbox for absent. If you cannot localize
+the target, do not answer confirmed. State its concrete image location and
+identity-specific appearance in visual_evidence.
 
 Return JSON only:
 {{
@@ -451,6 +453,17 @@ Return JSON only:
     model_presence = str(raw.get("presence", "absent")).strip().lower()
     if model_presence not in {"confirmed", "possible", "absent"}:
         model_presence = "absent"
+    box = normalized_box(raw.get("bbox_xyxy_normalized"))
+    visibility = max(
+        0.0, min(1.0, float(raw.get("visibility", 0.0)))
+    )
+    raw_model_presence = model_presence
+    adjustment = None
+    if model_presence in {"confirmed", "possible"} and (
+        box is None or visibility <= 0.0
+    ):
+        model_presence = "absent"
+        adjustment = "rejected_presence_without_bbox_or_visibility"
     if model_presence == "confirmed":
         evidence_score = confidence
         target_present = confidence >= CONFIRMED_THRESHOLD
@@ -460,18 +473,17 @@ Return JSON only:
     else:
         evidence_score = 0.0
         target_present = False
-    box = normalized_box(raw.get("bbox_xyxy_normalized"))
     return {
         "evidence_schema_version": EVIDENCE_SCHEMA_VERSION,
         "cam": cam,
         "frame_id": frame_id,
         "model_presence": model_presence,
+        "raw_model_presence": raw_model_presence,
+        "presence_adjustment": adjustment,
         "target_present": target_present,
         "evidence_score": round(evidence_score, 4),
         "bbox_xyxy_normalized": box,
-        "visibility": max(
-            0.0, min(1.0, float(raw.get("visibility", 0.0)))
-        ),
+        "visibility": visibility,
         "occlusion": str(raw.get("occlusion", "high")),
         "identity_confidence": confidence,
         "visual_evidence": str(raw.get("visual_evidence", "")),
@@ -480,12 +492,18 @@ Return JSON only:
 
 
 def is_supported(item: Mapping[str, Any]) -> bool:
-    return float(item.get("evidence_score", 0.0)) >= POSSIBLE_THRESHOLD
+    return bool(
+        item.get("bbox_xyxy_normalized")
+        and float(item.get("visibility", 0.0)) > 0.0
+        and float(item.get("evidence_score", 0.0)) >= POSSIBLE_THRESHOLD
+    )
 
 
 def is_confirmed(item: Mapping[str, Any]) -> bool:
     return (
         item.get("model_presence") == "confirmed"
+        and item.get("bbox_xyxy_normalized")
+        and float(item.get("visibility", 0.0)) > 0.0
         and float(item.get("identity_confidence", 0.0)) >= CONFIRMED_THRESHOLD
     )
 
@@ -639,6 +657,18 @@ def score_window(
     }
 
 
+def source_frame_proximity(
+    window: Mapping[str, Any],
+    temporal_index: Mapping[str, Any],
+    source_frame: int,
+) -> float:
+    """Weak same-take timing prior; never substitutes for visual evidence."""
+    camera = temporal_index["cameras"][str(window["cam"])]
+    video_span = max(1, int(camera.get("video_frame_span", 0)))
+    midpoint = (int(window["start_frame"]) + int(window["end_frame"])) / 2
+    return max(0.0, 1.0 - abs(midpoint - source_frame) / video_span)
+
+
 def verify_candidate_windows(
     qwen: Qwen,
     anchor: Mapping[str, Any],
@@ -658,14 +688,24 @@ def verify_candidate_windows(
     evidence_map = {
         (item["cam"], int(item["frame_id"])): item for item in evidence
     }
+    source_frame = int(anchor["metadata"]["source_best"]["frame_id"])
     ranked = []
     for window in all_windows(temporal_index):
         items = [
             evidence_map[(window["cam"], int(frame_id))]
             for frame_id in window["frame_ids"]
         ]
-        ranked.append((window, score_window(window, items)))
-    ranked.sort(key=lambda entry: entry[1]["overall"], reverse=True)
+        score = score_window(window, items)
+        score["source_frame_temporal_prior"] = source_frame_proximity(
+            window, temporal_index, source_frame
+        )
+        score["verification_priority"] = (
+            score["overall"] + 0.12 * score["source_frame_temporal_prior"]
+        )
+        ranked.append((window, score))
+    ranked.sort(
+        key=lambda entry: entry[1]["verification_priority"], reverse=True
+    )
 
     # Avoid spending all verification calls on nearly identical overlapping windows.
     selected: list[tuple[Mapping[str, Any], Mapping[str, Any]]] = []
@@ -701,6 +741,10 @@ summary spanning the ENTIRE candidate window {window_id}, frames
 
 Target identity:
 {json.dumps(identity, ensure_ascii=False)}
+
+The largest first-person source mask occurs at frame {source_frame} in the
+same take. Treat proximity to that frame only as a weak timing prior. It is not
+proof of third-person visibility and must not override the window images.
 
 Do not select a window because of one clear frame. Judge whether the target
 object is genuinely present through the beginning, middle, and end of this
@@ -766,6 +810,7 @@ def analyze_windows(
         (item["cam"], item["frame_id"]): item for item in evidence
     }
     runs = occurrence_runs(evidence)
+    source_frame = int(metadata["source_best"]["frame_id"])
     candidates = []
     for window in all_windows(temporal_index):
         items = [
@@ -773,6 +818,9 @@ def analyze_windows(
             for frame_id in window["frame_ids"]
         ]
         score = score_window(window, items)
+        score["source_frame_temporal_prior"] = source_frame_proximity(
+            window, temporal_index, source_frame
+        )
         verification = window_verifications.get(str(window["window_id"]))
         verification_ok = bool(
             verification
@@ -803,7 +851,13 @@ def analyze_windows(
         score["valid"] = score["valid"] and inside_run and verification_ok
         candidates.append((window, items, score))
 
-    candidates.sort(key=lambda entry: entry[2]["overall"], reverse=True)
+    candidates.sort(
+        key=lambda entry: (
+            entry[2]["overall"],
+            entry[2]["source_frame_temporal_prior"],
+        ),
+        reverse=True,
+    )
     valid = [entry for entry in candidates if entry[2]["valid"]]
     selected = valid[0] if valid else None
 
@@ -873,6 +927,10 @@ def analyze_windows(
         "source_best_mask": source["source_mask"],
         "source_best_mask_overlay": source["source_mask_overlay"],
         "source_mask_area_ratio": source["mask_area_ratio"],
+        "source_frame_temporal_prior": {
+            "frame_id": source["frame_id"],
+            "role": "weak same-take timing prior; visual evidence remains required",
+        },
         "source_identity": identity,
         "occurrence_spans": runs,
         "selection_constraints": {
@@ -1205,9 +1263,14 @@ def render_result(
     else:
         selected_items = timeline_bin_samples(evidence, 5, highest=True)
 
+    evidence_heading = (
+        "SELECTED WINDOW EVIDENCE"
+        if best
+        else "TIMELINE EVIDENCE (NO WINDOW SELECTED)"
+    )
     draw.text(
         (445, 180),
-        "SELECTED / OCCURRENCE EVIDENCE",
+        evidence_heading,
         font=body_font,
         fill=(20, 27, 31),
     )
@@ -1246,7 +1309,7 @@ def render_result(
             for frame_id in rejected_window["representative_frame_ids"]
         ]
         comparison_label = (
-            f"COMPARISON: rejected {rejected_id} "
+            f"REJECTED CANDIDATE: {rejected_id} "
             f"({rejected_window['start_frame']}-{rejected_window['end_frame']})"
         )
     else:
@@ -1355,16 +1418,20 @@ def process_case(
         print(f"Identity: {identity.get('object_identity')}", flush=True)
 
         evidence = []
+        evidence_cache_invalidated = False
         if evidence_path.exists() and not force:
             evidence = read_json(evidence_path)
             if evidence and any(
                 item.get("evidence_schema_version") != EVIDENCE_SCHEMA_VERSION
                 for item in evidence
             ):
-                raise ValueError(
-                    "Cached frame evidence uses the obsolete schema. Use a new "
-                    "--work-dir or rerun with --force."
+                print(
+                    "Cached frame evidence uses an obsolete schema; "
+                    "recomputing this case.",
+                    flush=True,
                 )
+                evidence = []
+                evidence_cache_invalidated = True
         completed = {
             (item["cam"], int(item["frame_id"])) for item in evidence
         }
@@ -1398,7 +1465,7 @@ def process_case(
             evidence,
             catalog,
             work_case,
-            force,
+            force or evidence_cache_invalidated,
         )
         result = analyze_windows(
             anchor["metadata"],
@@ -1451,13 +1518,15 @@ def main() -> None:
             )
         except Exception as error:
             print(f"ERROR: {case_dir.name}: {error}", flush=True)
-            summaries.append(
-                {
-                    "case_id": case_dir.name,
-                    "status": "failed",
-                    "error": str(error),
-                }
-            )
+            failure = {
+                "schema_version": 4,
+                "case_id": case_dir.name,
+                "status": "failed",
+                "best_segment": None,
+                "error": str(error),
+            }
+            write_json(case_dir / "temporal_analysis_result.json", failure)
+            summaries.append(failure)
     write_json(root / "batch_temporal_analysis_summary.json", summaries)
     failed = [item for item in summaries if item["status"] == "failed"]
     print(

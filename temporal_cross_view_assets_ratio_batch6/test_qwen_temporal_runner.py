@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import unittest
+import tempfile
 from pathlib import Path
 
 import qwen_temporal_runner as runner
@@ -19,14 +20,15 @@ def synthetic_evidence(first: int, last: int) -> list[dict]:
         present = first <= frame_id <= last
         evidence.append(
             {
-                "evidence_schema_version": 2,
+                "evidence_schema_version": runner.EVIDENCE_SCHEMA_VERSION,
                 "cam": "cam01",
                 "frame_id": frame_id,
                 "model_presence": "confirmed" if present else "absent",
                 "target_present": present,
                 "evidence_score": 0.9 if present else 0.0,
-                # Presence must not depend on whether localization succeeded.
-                "bbox_xyxy_normalized": None,
+                "bbox_xyxy_normalized": (
+                    [0.25, 0.25, 0.45, 0.55] if present else None
+                ),
                 "visibility": 0.9 if present else 0.0,
                 "occlusion": "low" if present else "none",
                 "identity_confidence": 0.9 if present else 0.1,
@@ -92,10 +94,11 @@ class TemporalSelectionTests(unittest.TestCase):
         self.assertEqual(result["status"], "uncertain")
         self.assertIsNone(result["best_segment"])
 
-    def test_presence_does_not_require_bbox(self) -> None:
+    def test_presence_requires_bbox(self) -> None:
         item = synthetic_evidence(1200, 1200)[40]
-        self.assertTrue(runner.is_supported(item))
-        self.assertIsNone(item["bbox_xyxy_normalized"])
+        item["bbox_xyxy_normalized"] = None
+        self.assertFalse(runner.is_supported(item))
+        self.assertFalse(runner.is_confirmed(item))
 
     def test_uncertain_samples_span_timeline(self) -> None:
         evidence = synthetic_evidence(2100, 2100)
@@ -105,6 +108,26 @@ class TemporalSelectionTests(unittest.TestCase):
         ]
         self.assertNotEqual(frame_ids, [0, 30, 60, 90, 120])
         self.assertGreater(frame_ids[-1] - frame_ids[0], 3000)
+
+    def test_case_without_numeric_suffix_is_discovered(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            case = Path(tmp) / "take__CPR_dummy"
+            case.mkdir()
+            (case / "metadata.json").write_text("{}", encoding="utf-8")
+            (case / "temporal_window_index.json").write_text(
+                "{}", encoding="utf-8"
+            )
+            discovered = runner.case_directories(Path(tmp), [])
+        self.assertEqual([path.name for path in discovered], ["take__CPR_dummy"])
+
+    def test_source_frame_is_used_only_as_window_tiebreaker(self) -> None:
+        early, late = list(runner.all_windows(self.index))[0:2]
+        source_frame = int(self.metadata["source_best"]["frame_id"])
+        early_prior = runner.source_frame_proximity(
+            early, self.index, source_frame
+        )
+        late_prior = runner.source_frame_proximity(late, self.index, source_frame)
+        self.assertNotEqual(early_prior, late_prior)
 
 
 if __name__ == "__main__":
