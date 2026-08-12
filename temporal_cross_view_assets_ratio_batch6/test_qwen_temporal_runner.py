@@ -58,15 +58,29 @@ class TemporalSelectionTests(unittest.TestCase):
             ]
             supported = sum(runner.is_supported(item) for item in items)
             if supported >= 2:
+                supported_items = [
+                    item for item in items if runner.is_supported(item)
+                ]
+                representative = supported_items[0]
                 output[window["window_id"]] = {
                     "verification_schema_version": (
                         runner.WINDOW_VERIFICATION_SCHEMA_VERSION
                     ),
                     "contains_target_occurrence": True,
                     "visible_summary_position_count": min(9, supported),
-                    "representative_frame_id": next(
-                        item["frame_id"] for item in items if runner.is_supported(item)
-                    ),
+                    "verified_frame_ids": [
+                        item["frame_id"] for item in items[:9]
+                    ],
+                    "frame_results": [
+                        {
+                            "frame_id": representative["frame_id"],
+                            "presence": "confirmed",
+                            "target_present": True,
+                            "bbox_xyxy_normalized": [0.25, 0.25, 0.45, 0.55],
+                            "identity_confidence": 0.9,
+                        }
+                    ],
+                    "representative_frame_id": representative["frame_id"],
                     "representative_bbox_xyxy_normalized": [
                         0.25,
                         0.25,
@@ -232,6 +246,40 @@ class TemporalSelectionTests(unittest.TestCase):
         self.assertIn(window["start_frame"], displayed_ids)
         self.assertIn(window["end_frame"], displayed_ids)
         self.assertTrue(any(runner.is_supported(item) for item in displayed))
+
+    def test_window_verification_uses_full_timeline_and_localized_scouts(self) -> None:
+        evidence = synthetic_evidence(390, 450)
+        evidence_map = {
+            (item["cam"], item["frame_id"]): item for item in evidence
+        }
+        window = next(runner.all_windows(self.index))
+        frame_ids = runner.window_verification_frame_ids(window, evidence_map)
+        self.assertIn(window["start_frame"], frame_ids)
+        self.assertIn(window["end_frame"], frame_ids)
+        self.assertTrue(any(390 <= frame_id <= 450 for frame_id in frame_ids))
+        self.assertLessEqual(len(frame_ids), 8)
+
+    def test_renderer_ignores_scout_boxes_until_independent_verification(self) -> None:
+        evidence = synthetic_evidence(0, 60)[:3]
+        verified = {
+            "window": {
+                "cam": "cam01",
+                "frame_results": [
+                    {
+                        "frame_id": 30,
+                        "target_present": True,
+                        "bbox_xyxy_normalized": [0.1, 0.2, 0.3, 0.4],
+                        "identity_confidence": 0.9,
+                    }
+                ],
+            }
+        }
+        render_evidence = runner.verified_render_evidence(evidence, verified)
+        self.assertIsNone(render_evidence[("cam01", 0)]["bbox_xyxy_normalized"])
+        self.assertEqual(
+            render_evidence[("cam01", 30)]["inference_kind"],
+            "window-verified",
+        )
 
 
 if __name__ == "__main__":

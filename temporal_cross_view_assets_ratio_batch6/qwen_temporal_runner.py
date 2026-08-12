@@ -22,8 +22,8 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 CASE_GLOB = "*__*"
 EVIDENCE_SCHEMA_VERSION = 4
-WINDOW_VERIFICATION_SCHEMA_VERSION = 4
-RESULT_SCHEMA_VERSION = 6
+WINDOW_VERIFICATION_SCHEMA_VERSION = 5
+RESULT_SCHEMA_VERSION = 7
 CONFIRMED_THRESHOLD = 0.50
 POSSIBLE_THRESHOLD = 0.45
 WINDOW_SUPPORT_FRACTION = 0.60
@@ -53,7 +53,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--render-only", action="store_true")
     parser.add_argument("--force", action="store_true")
-    parser.add_argument("--max-new-tokens", type=int, default=320)
+    parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument(
         "--max-frame-probes-per-camera",
         type=int,
@@ -1111,6 +1111,44 @@ def verification_candidates(
     return selected[:limit]
 
 
+def window_verification_frame_ids(
+    window: Mapping[str, Any],
+    evidence_map: Mapping[tuple[str, int], Mapping[str, Any]],
+) -> list[int]:
+    """Keep target frames large while covering the full continuous window."""
+    frame_ids = [int(frame_id) for frame_id in window["frame_ids"]]
+    uniform = [
+        frame_ids[round(index * (len(frame_ids) - 1) / 4)]
+        for index in range(5)
+    ]
+    localized = sorted(
+        (
+            evidence_map[(window["cam"], frame_id)]
+            for frame_id in frame_ids
+            if is_supported(evidence_map[(window["cam"], frame_id)])
+            and evidence_map[(window["cam"], frame_id)].get(
+                "inference_kind", "qwen"
+            )
+            == "qwen"
+        ),
+        key=lambda item: (
+            float(item.get("evidence_score", 0.0))
+            * float(item.get("visibility", 0.0))
+        ),
+        reverse=True,
+    )
+    priority: list[int] = []
+    positions = {frame_id: index for index, frame_id in enumerate(frame_ids)}
+    for item in localized:
+        frame_id = int(item["frame_id"])
+        if any(abs(positions[frame_id] - positions[other]) <= 1 for other in priority):
+            continue
+        priority.append(frame_id)
+        if len(priority) >= 3:
+            break
+    return sorted(dict.fromkeys([*uniform, *priority]), key=positions.get)
+
+
 def verify_candidate_windows(
     qwen: Qwen,
     anchor: Mapping[str, Any],
@@ -1155,35 +1193,20 @@ def verify_candidate_windows(
             f"{window['start_frame']}-{window['end_frame']}",
             flush=True,
         )
-        priority_items = sorted(
-            (
-                evidence_map[(window["cam"], int(frame_id))]
-                for frame_id in window["frame_ids"]
-                if is_supported(evidence_map[(window["cam"], int(frame_id))])
-                and evidence_map[(window["cam"], int(frame_id))].get(
-                    "inference_kind", "qwen"
-                )
-                == "qwen"
-            ),
-            key=lambda item: float(item.get("evidence_score", 0.0)),
-            reverse=True,
-        )
-        summary_path = make_window_summary(
-            window,
-            catalog,
-            work_case,
-            [int(item["frame_id"]) for item in priority_items[:3]],
-        )
+        target_frame_ids = window_verification_frame_ids(window, evidence_map)
+        image_map = [
+            {"image_number": index + 4, "frame_id": frame_id}
+            for index, frame_id in enumerate(target_frame_ids)
+        ]
         prompt = f"""
-Evaluate one complete third-person candidate window against a first-person
-binary-mask identity anchor.
+Independently verify several full-resolution frames from one continuous
+third-person candidate window against a first-person binary-mask identity.
 
 Images 1-3 are the complete source frame, source context crop with a synthetic
-cyan marker, and original-RGB masked object. Image 4 is a chronological 3x3
-summary spanning the ENTIRE candidate window {window_id}, frames
-{window['start_frame']}-{window['end_frame']}. The nine labels are real frame
-IDs. A "scout evidence" label only means an earlier probe proposed that frame;
-you must independently accept or reject its object identity.
+cyan marker, and original-RGB masked object. Images 4 onward are separate,
+standalone third-person frames from continuous window {window_id}, frames
+{window['start_frame']}-{window['end_frame']}. They are not a contact sheet:
+{json.dumps(image_map, ensure_ascii=False)}
 
 Target identity:
 {json.dumps(identity, ensure_ascii=False)}
@@ -1192,80 +1215,121 @@ The largest first-person source mask occurs at frame {source_frame} in the
 same take. Treat proximity to that frame only as a weak timing prior. It is not
 proof of third-person visibility and must not override the window images.
 
-The target does NOT need to remain visible throughout the complete window.
-Judge whether this continuous candidate contains a genuine, identity-matching
-occurrence in at least two nearby summary positions. Generic scene activity
-and one isolated ambiguous glimpse do not count. This candidate is compared
-with equal-duration windows from other timeline regions. The frame-level
-pre-score is only a hint:
-{json.dumps(frame_score, ensure_ascii=False)}
-
-If present, choose one clearly visible labeled frame as representative_frame_id
-and return a tight target bbox normalized within that frame's own 640x360 image
-cell, not within the full 3x3 summary. Do not box the person or workspace.
+Evaluate EVERY target frame independently. Match the masked object's structure,
+parts, true color, and material. Do not infer presence from scene activity or
+from another frame. A positive frame requires a tight bbox around the target
+itself; do not box a person, hand, table, appliance, or nearby object. Bbox
+coordinates are normalized within that one standalone image. The object may be
+absent in most of the legal 20% window.
 
 Return JSON only:
 {{
   "window_id": "{window_id}",
-  "target_in_beginning": false,
-  "target_in_middle": false,
-  "target_in_end": false,
-  "contains_target_occurrence": false,
-  "visible_summary_position_count": 0,
-  "first_visible_frame_id": null,
-  "last_visible_frame_id": null,
-  "representative_frame_id": null,
-  "representative_bbox_xyxy_normalized": null,
-  "identity_confidence": 0.0,
-  "reason": "maximum 18 words about the localized occurrence"
+  "frames": [
+    {{
+      "frame_id": {target_frame_ids[0]},
+      "presence": "confirmed|possible|absent",
+      "bbox_xyxy_normalized": null,
+      "identity_confidence": 0.0
+    }}
+  ]
 }}
+Return exactly one frames entry for every frame ID in the image map. Do not
+return an overall presence decision; deterministic code will calculate it.
 """
         raw = qwen.ask(
             [
                 anchor["frame_path"],
                 anchor["context_path"],
                 anchor["isolated_path"],
-                summary_path,
+                *[
+                    catalog[(window["cam"], frame_id)]
+                    for frame_id in target_frame_ids
+                ],
             ],
             prompt,
         )
         if not isinstance(raw, dict):
             raise ValueError(f"Window verification is not JSON: {window_id}")
-        confidence = max(
-            0.0, min(1.0, float(raw.get("identity_confidence", 0.0)))
+        returned = {}
+        for item in raw.get("frames", []):
+            if not isinstance(item, dict) or item.get("frame_id") is None:
+                continue
+            try:
+                returned[int(item["frame_id"])] = item
+            except (TypeError, ValueError):
+                continue
+        frame_results = []
+        for frame_id in target_frame_ids:
+            item = returned.get(frame_id, {})
+            presence = str(item.get("presence", "absent")).lower()
+            confidence = max(
+                0.0,
+                min(1.0, float(item.get("identity_confidence", 0.0))),
+            )
+            box = normalized_box(item.get("bbox_xyxy_normalized"))
+            accepted = bool(
+                box
+                and (
+                    (presence == "confirmed" and confidence >= CONFIRMED_THRESHOLD)
+                    or (presence == "possible" and confidence >= 0.70)
+                )
+            )
+            frame_results.append(
+                {
+                    "frame_id": frame_id,
+                    "presence": presence if accepted else "absent",
+                    "target_present": accepted,
+                    "bbox_xyxy_normalized": box if accepted else None,
+                    "identity_confidence": confidence if accepted else 0.0,
+                }
+            )
+        positives = [item for item in frame_results if item["target_present"]]
+        representative = max(
+            positives,
+            key=lambda item: float(item["identity_confidence"]),
+            default=None,
         )
+        thirds = max(1, len(target_frame_ids) // 3)
         cached[window_id] = {
             "verification_schema_version": WINDOW_VERIFICATION_SCHEMA_VERSION,
             "window_id": window_id,
-            "target_in_beginning": model_bool(raw.get("target_in_beginning")),
-            "target_in_middle": model_bool(raw.get("target_in_middle")),
-            "target_in_end": model_bool(raw.get("target_in_end")),
-            "contains_target_occurrence": model_bool(
-                raw.get("contains_target_occurrence")
+            "cam": str(window["cam"]),
+            "verified_frame_ids": target_frame_ids,
+            "frame_results": frame_results,
+            "target_in_beginning": any(
+                item["target_present"] for item in frame_results[:thirds]
             ),
-            "visible_summary_position_count": max(
-                0, min(9, int(raw.get("visible_summary_position_count", 0)))
+            "target_in_middle": any(
+                item["target_present"] for item in frame_results[thirds:-thirds]
             ),
+            "target_in_end": any(
+                item["target_present"] for item in frame_results[-thirds:]
+            ),
+            "contains_target_occurrence": bool(positives),
+            "visible_summary_position_count": len(positives),
             "first_visible_frame_id": (
-                int(raw["first_visible_frame_id"])
-                if raw.get("first_visible_frame_id") is not None
-                else None
+                positives[0]["frame_id"] if positives else None
             ),
             "last_visible_frame_id": (
-                int(raw["last_visible_frame_id"])
-                if raw.get("last_visible_frame_id") is not None
-                else None
+                positives[-1]["frame_id"] if positives else None
             ),
             "representative_frame_id": (
-                int(raw["representative_frame_id"])
-                if raw.get("representative_frame_id") is not None
+                representative["frame_id"] if representative else None
+            ),
+            "representative_bbox_xyxy_normalized": (
+                representative["bbox_xyxy_normalized"]
+                if representative
                 else None
             ),
-            "representative_bbox_xyxy_normalized": normalized_box(
-                raw.get("representative_bbox_xyxy_normalized")
+            "identity_confidence": (
+                float(representative["identity_confidence"])
+                if representative
+                else 0.0
             ),
-            "identity_confidence": confidence,
-            "reason": str(raw.get("reason", "")),
+            "reason": (
+                f"Independent full-frame matches: {len(positives)}/{len(frame_results)}."
+            ),
             "raw_model_response": raw,
         }
         write_json(cache_path, cached)
@@ -1300,7 +1364,7 @@ def analyze_windows(
         verification_ok = bool(
             verification
             and verification.get("contains_target_occurrence")
-            and int(verification.get("visible_summary_position_count", 0)) >= 2
+            and int(verification.get("visible_summary_position_count", 0)) >= 1
             and verification.get("representative_frame_id")
             in window["frame_ids"]
             and verification.get("representative_bbox_xyxy_normalized")
@@ -1312,15 +1376,19 @@ def analyze_windows(
         verification_identity = float(
             (verification or {}).get("identity_confidence", 0.0)
         )
+        verification_frame_fraction = int(
+            (verification or {}).get("visible_summary_position_count", 0)
+        ) / max(1, len((verification or {}).get("verified_frame_ids", [])))
+        score["verification_frame_fraction"] = verification_frame_fraction
         if verification:
             score["overall"] = (
                 0.80 * score["overall"]
                 + 0.20 * verification_identity
             )
         score["selection_score"] = (
-            0.30 * score["captured_occurrence_fraction"]
+            0.30 * verification_frame_fraction
             + 0.25 * verification_identity
-            + 0.15 * score["mean_evidence_score"]
+            + 0.15 * score["captured_occurrence_fraction"]
             + 0.10 * score["bbox_temporal_stability"]
             + 0.10 * score["real_probe_support_fraction"]
             + 0.05 * score["mean_visibility"]
@@ -1454,9 +1522,9 @@ def analyze_windows(
             "preferred_ratio": 0.20,
             "candidate_comparison": "equal-duration temporal bins per camera",
             "ranking_weights": {
-                "captured_occurrence_fraction": 0.30,
+                "independently_verified_frame_fraction": 0.30,
                 "window_identity_verification": 0.25,
-                "mean_frame_evidence": 0.15,
+                "captured_occurrence_fraction": 0.15,
                 "bbox_temporal_stability": 0.10,
                 "real_probe_support_fraction": 0.10,
                 "mean_visibility": 0.05,
@@ -1476,7 +1544,7 @@ def analyze_windows(
     if not selected:
         result["uncertainty"] = (
             "No generated 20%-30% continuous window contains at least two "
-            "localized occurrence samples and passes occurrence verification."
+            "localized scout samples and one independently verified full-frame match."
         )
         result["confidence"] = round(
             max((entry[2]["overall"] for entry in candidates), default=0.0), 4
@@ -1484,7 +1552,33 @@ def analyze_windows(
         return result
 
     window, items, score = selected
-    stable = median_box(items)
+    verified_items = [
+        item
+        for item in (score["window_verification"] or {}).get(
+            "frame_results", []
+        )
+        if item.get("target_present")
+    ]
+    verified_boxes = [
+        item["bbox_xyxy_normalized"] for item in verified_items
+    ]
+    stable = (
+        [round(statistics.median(values), 4) for values in zip(*verified_boxes)]
+        if verified_boxes
+        else None
+    )
+    verified_representatives = [
+        {
+            "frame_id": item["frame_id"],
+            "target_region_xyxy": item["bbox_xyxy_normalized"],
+            "visibility": 1.0,
+            "occlusion": "independently_verified",
+            "identity_confidence": item["identity_confidence"],
+            "model_presence": item["presence"],
+            "evidence_score": item["identity_confidence"],
+        }
+        for item in verified_items
+    ]
     challenger_score = (
         float(challenger[2]["selection_score"]) if challenger else None
     )
@@ -1523,13 +1617,23 @@ def analyze_windows(
                 "captured_occurrence_fraction",
             )
         },
-        "representative_frames": select_representatives(items),
+        "independently_verified_occurrence": {
+            "first_visible_frame": verified_items[0]["frame_id"],
+            "last_visible_frame": verified_items[-1]["frame_id"],
+            "verified_frame_count": len(verified_items),
+            "tested_frame_count": len(
+                (score["window_verification"] or {}).get(
+                    "verified_frame_ids", []
+                )
+            ),
+        },
+        "representative_frames": verified_representatives,
         "target_region_summary": {
             "coordinate_system": "normalized_xyxy_per_frame",
             "stable_region_xyxy": stable,
             "region_explanation": (
-                "Median of Qwen-confirmed per-frame boxes inside the selected "
-                "window; boxes are localization evidence, not masks."
+                "Median of independently rechecked standalone-frame boxes; "
+                "boxes are localization evidence, not masks."
             ),
         },
         "scores": {
@@ -1751,6 +1855,53 @@ def timeline_bin_samples(
     return output
 
 
+def verified_render_evidence(
+    evidence: list[dict[str, Any]],
+    window_verifications: Mapping[str, Mapping[str, Any]],
+) -> dict[tuple[str, int], dict[str, Any]]:
+    """Render only boxes independently rechecked as standalone full frames."""
+    output: dict[tuple[str, int], dict[str, Any]] = {}
+    for item in evidence:
+        cleared = dict(item)
+        cleared.update(
+            {
+                "model_presence": "unverified",
+                "target_present": False,
+                "bbox_xyxy_normalized": None,
+                "visibility": 0.0,
+                "identity_confidence": 0.0,
+                "evidence_score": 0.0,
+                "inference_kind": "scout-only",
+            }
+        )
+        output[(str(item["cam"]), int(item["frame_id"]))] = cleared
+    for verification in window_verifications.values():
+        cam = str(verification.get("cam", ""))
+        for item in verification.get("frame_results", []):
+            key = (cam, int(item["frame_id"]))
+            if key not in output or not item.get("target_present"):
+                continue
+            confidence = float(item.get("identity_confidence", 0.0))
+            previous = output[key]
+            if (
+                previous.get("inference_kind") == "window-verified"
+                and float(previous.get("identity_confidence", 0.0)) >= confidence
+            ):
+                continue
+            previous.update(
+                {
+                    "model_presence": "confirmed",
+                    "target_present": True,
+                    "bbox_xyxy_normalized": item["bbox_xyxy_normalized"],
+                    "visibility": 1.0,
+                    "identity_confidence": confidence,
+                    "evidence_score": confidence,
+                    "inference_kind": "window-verified",
+                }
+            )
+    return output
+
+
 def window_display_items(
     window: Mapping[str, Any],
     evidence_map: Mapping[tuple[str, int], Mapping[str, Any]],
@@ -1834,9 +1985,9 @@ def render_result(
             (35, 612 + row * 24), line, font=small_font, fill=(45, 51, 54)
         )
 
-    evidence_map = {
-        (item["cam"], item["frame_id"]): item for item in evidence
-    }
+    evidence_map = verified_render_evidence(
+        evidence, result.get("window_verifications", {})
+    )
     selected_sheet = render_selected_contact_sheet(
         case_dir,
         output_dir,

@@ -24,20 +24,22 @@ Qwen3.5 with 4B parameters; it does not mean a 3.5B model.
 8. Divide every target-camera timeline into equal temporal bins and verify one
    20% challenger from every bin. This prevents a source-near local optimum
    from hiding a visually stronger segment elsewhere in the video.
-9. Recheck each challenger with a chronological 3x3 summary. Include up to
-   three real positive scouts in the summary, then independently verify their
-   identity and extract first, representative, and last visible frame IDs.
+9. Recheck each challenger using five time-distributed standalone full frames
+   plus up to three strong scout frames. Do not use a compressed 3x3 contact
+   sheet as a hard decision input. Qwen returns one presence and bbox result per
+   standalone frame; deterministic code derives the window-level decision.
 10. Prefer a generated 20% continuous window that captures the most evidence
    from a localized occurrence. The target may be absent in surrounding window
    context when its true occurrence is shorter than 20%; this is the equivalent
    of padding the shorter side until the legal duration is reached.
-11. Rank legal windows by occurrence capture (30%), independent window identity
-   verification (25%), frame evidence (15%), box stability (10%), real-probe
-   support (10%), visibility (5%), and source-time proximity (5%).
+11. Rank legal windows by independently verified frame fraction (30%),
+   independent identity confidence (25%), occurrence capture (15%), box
+   stability (10%), real-probe support (10%), visibility (5%), and source-time
+   proximity (5%).
 12. Deterministically reject a window unless it captures at least two supported
-   localized samples, including one confirmed sample, and Qwen verifies that
-   the summary contains the identity-matching occurrence. A one-frame ambiguous
-   glimpse is insufficient.
+   localized scout samples, including one confirmed scout, and at least one
+   standalone full-frame verification supplies a valid target bbox. A positive
+   claim without localization is insufficient.
 13. Compare the winner with the best non-overlapping, equal-duration global
    challenger. Select the strongest verified continuous window or emit
    `uncertain`.
@@ -103,6 +105,10 @@ the same total GPU-hours and is subject to project and queue concurrency limits.
 Use the new work directory shown above. Earlier frame caches used a different
 bbox coordinate system and window-verification schema and must not be mixed
 with this run.
+
+When upgrading from result schema 6 to schema 7, reuse the same work directory
+without `--force`. Frame scouts are reused; only the eight lightweight window
+verification calls per case are recomputed because their cache schema changed.
 
 The frame evidence for the command above is saved under:
 
