@@ -2258,37 +2258,6 @@ def process_case(
             work_case,
             force or evidence_cache_invalidated,
         )
-        windows_by_id = {
-            str(window["window_id"]): window for window in all_windows(temporal_index)
-        }
-        rescue_keys = []
-        for window_id, verification in window_verifications.items():
-            window = windows_by_id.get(window_id)
-            if not window or not verification.get("contains_target_occurrence"):
-                continue
-            for field in (
-                "first_visible_frame_id",
-                "representative_frame_id",
-                "last_visible_frame_id",
-            ):
-                frame_id = verification.get(field)
-                if frame_id in window["frame_ids"]:
-                    rescue_keys.append((str(window["cam"]), int(frame_id)))
-        assess_pending(rescue_keys, "window-rescue")
-        rescue_refinement = refinement_keys(
-            catalog,
-            actual_evidence,
-            probe_refinement_radius,
-            int(anchor["metadata"]["source_best"]["frame_id"]),
-        )
-        assess_pending(rescue_refinement, "rescue-refine")
-        evidence = interpolate_evidence(
-            actual_evidence,
-            catalog,
-            probe_config,
-            max_position_gap=probe_refinement_radius * 2 + 2,
-        )
-        write_json(evidence_path, evidence)
         result = analyze_windows(
             anchor["metadata"],
             temporal_index,
