@@ -64,6 +64,15 @@ class TemporalSelectionTests(unittest.TestCase):
                     ),
                     "contains_target_occurrence": True,
                     "visible_summary_position_count": min(9, supported),
+                    "representative_frame_id": next(
+                        item["frame_id"] for item in items if runner.is_supported(item)
+                    ),
+                    "representative_bbox_xyxy_normalized": [
+                        0.25,
+                        0.25,
+                        0.45,
+                        0.55,
+                    ],
                     "identity_confidence": 0.9,
                     "target_in_beginning": True,
                     "target_in_middle": True,
@@ -150,6 +159,79 @@ class TemporalSelectionTests(unittest.TestCase):
         )
         late_prior = runner.source_frame_proximity(late, self.index, source_frame)
         self.assertNotEqual(early_prior, late_prior)
+
+    def test_source_centered_probe_schedule_is_bounded_and_covers_edges(self) -> None:
+        catalog = {
+            ("cam01", frame_id): Path(f"{frame_id}.jpg")
+            for frame_id in range(0, 61951, 30)
+        }
+        keys = runner.scan_keys(catalog, source_frame=0, max_per_camera=40)
+        self.assertLessEqual(len(keys), 40)
+        self.assertIn(("cam01", 0), keys)
+        self.assertIn(("cam01", 61950), keys)
+        self.assertTrue(all(("cam01", value) in keys for value in range(0, 270, 30)))
+
+    def test_inconsistent_boxes_are_not_interpolated(self) -> None:
+        self.assertFalse(
+            runner.boxes_temporally_consistent(
+                [0.05, 0.05, 0.10, 0.10],
+                [0.75, 0.75, 0.95, 0.95],
+            )
+        )
+        self.assertTrue(
+            runner.boxes_temporally_consistent(
+                [0.20, 0.20, 0.35, 0.40],
+                [0.22, 0.21, 0.37, 0.41],
+            )
+        )
+
+    def test_refinement_is_bounded_when_every_scout_is_positive(self) -> None:
+        catalog = {
+            ("cam01", frame_id): Path(f"{frame_id}.jpg")
+            for frame_id in range(0, 3000, 30)
+        }
+        evidence = synthetic_evidence(0, 4350)[:100]
+        keys = runner.refinement_keys(
+            catalog,
+            evidence,
+            radius=2,
+            source_frame=1500,
+            max_seeds_per_camera=3,
+        )
+        self.assertLessEqual(len(keys), 15)
+
+    def test_verification_candidates_cover_the_full_timeline(self) -> None:
+        evidence = synthetic_evidence(2100, 2400)
+        selected = runner.verification_candidates(
+            self.index,
+            evidence,
+            source_frame=int(self.metadata["source_best"]["frame_id"]),
+            limit=8,
+        )
+        starts = sorted(int(window["start_frame"]) for window, _ in selected)
+        self.assertTrue(
+            all(float(window["requested_video_ratio"]) == 0.20 for window, _ in selected)
+        )
+        self.assertLess(starts[0], 1000)
+        self.assertGreater(starts[-1], 3000)
+
+    def test_occurrence_runs_do_not_join_different_cameras(self) -> None:
+        evidence = synthetic_evidence(0, 30)[:2]
+        second_camera = [dict(item, cam="cam02") for item in evidence]
+        runs = runner.occurrence_runs([*evidence, *second_camera])
+        self.assertEqual([run["cam"] for run in runs], ["cam01", "cam02"])
+
+    def test_window_display_includes_endpoints_and_short_occurrence(self) -> None:
+        evidence = synthetic_evidence(390, 450)
+        evidence_map = {
+            (item["cam"], item["frame_id"]): item for item in evidence
+        }
+        window = next(runner.all_windows(self.index))
+        displayed = runner.window_display_items(window, evidence_map)
+        displayed_ids = [item["frame_id"] for item in displayed]
+        self.assertIn(window["start_frame"], displayed_ids)
+        self.assertIn(window["end_frame"], displayed_ids)
+        self.assertTrue(any(runner.is_supported(item) for item in displayed))
 
 
 if __name__ == "__main__":

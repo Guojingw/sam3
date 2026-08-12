@@ -11,22 +11,41 @@ Qwen3.5 with 4B parameters; it does not mean a 3.5B model.
    are explicitly excluded from identity inference.
 3. Extract each unique third-person sampled frame from the generated temporal
    contact sheets and build previous/query/next context strips.
-4. Ask Qwen for `confirmed`, `possible`, or `absent` evidence on every query
-   frame. Presence and bounding-box validity are evaluated independently.
-5. Build independent occurrence spans for each case.
-6. Use the largest source-mask frame as a weak same-take timing prior, then
-   recheck the strongest candidate windows with a chronological 3x3 summary.
-7. Prefer a generated 20% continuous window that captures the most evidence
+4. Use the largest first-person mask frame as the synchronized search origin.
+   Probe densely around that frame, then expand exponentially toward the video
+   boundaries rather than uniformly evaluating every frame.
+5. Give Qwen the query frame as a standalone image and the three-frame strip
+   only as context. Bounding boxes are normalized to the standalone query.
+6. Rank genuine positive scouts by identity, visibility, localization quality,
+   and source-time proximity. Expand both directions around at most six
+   non-overlapping seeds per camera. Intermediate frames receive support only
+   when bracketed by two real, spatially consistent localized detections.
+7. Build independent occurrence spans for each case.
+8. Divide every target-camera timeline into equal temporal bins and verify one
+   20% challenger from every bin. This prevents a source-near local optimum
+   from hiding a visually stronger segment elsewhere in the video.
+9. Recheck each challenger with a chronological 3x3 summary. Include up to
+   three real positive scouts in the summary, then independently verify their
+   identity and extract first, representative, and last visible frame IDs.
+10. Prefer a generated 20% continuous window that captures the most evidence
    from a localized occurrence. The target may be absent in surrounding window
-   context when its true occurrence is shorter than 20% of the video.
-8. Deterministically reject a window unless it captures at least two supported
+   context when its true occurrence is shorter than 20%; this is the equivalent
+   of padding the shorter side until the legal duration is reached.
+11. Rank legal windows by occurrence capture (30%), independent window identity
+   verification (25%), frame evidence (15%), box stability (10%), real-probe
+   support (10%), visibility (5%), and source-time proximity (5%).
+12. Deterministically reject a window unless it captures at least two supported
    localized samples, including one confirmed sample, and Qwen verifies that
    the summary contains the identity-matching occurrence. A one-frame ambiguous
    glimpse is insufficient.
-9. Select the strongest verified occurrence-containing window or emit
+13. Compare the winner with the best non-overlapping, equal-duration global
+   challenger. Select the strongest verified continuous window or emit
    `uncertain`.
-10. Rewrite `temporal_analysis_result.json`, render the comparison image, and
+14. Rewrite `temporal_analysis_result.json`, render the comparison image, and
    update `batch_temporal_analysis_summary.json`.
+
+The synchronized source frame is a search origin, not a hard target frame. If
+the visually strongest third-person occurrence is earlier or later, it wins.
 
 ## NSCC commands
 
@@ -56,7 +75,7 @@ one-GPU job per case instead:
 
 ```bash
 EASY6="/scratch/users/ntu/$USER/temporal_cross_view_assets_ratio_easy6"
-WORK="/scratch/users/ntu/$USER/qwen35-4b/temporal_easy6_parallel_v1"
+WORK="/scratch/users/ntu/$USER/qwen35-4b/temporal_easy6_source_centered_v2"
 
 cd "$HOME/worldmodel/sam3/temporal_cross_view_assets_ratio_batch6"
 bash submit_qwen_temporal_parallel.sh "$EASY6" "$WORK"
@@ -81,25 +100,27 @@ PYTHON="$HOME/.conda/envs/sam3/bin/python"
 
 Parallel execution reduces elapsed wall-clock time but consumes approximately
 the same total GPU-hours and is subject to project and queue concurrency limits.
+Use the new work directory shown above. Earlier frame caches used a different
+bbox coordinate system and window-verification schema and must not be mixed
+with this run.
 
-The frame evidence is saved under:
+The frame evidence for the command above is saved under:
 
 ```text
-/scratch/users/ntu/gwang016/qwen35-4b/temporal_batch6_work_v2/
+/scratch/users/ntu/gwang016/qwen35-4b/temporal_easy6_source_centered_v2/
 ```
 
 Rerunning the PBS script resumes from cached completed frames. To discard the
 cache for one case, pass `--force --case sugar_container` in an interactive
 run. Do not use `--force` for ordinary resume.
 
-Render again without loading Qwen:
+Render again without loading Qwen or requesting a GPU:
 
 ```bash
-source "$HOME/scratch/qwen35-4b/env/bin/activate"
 cd "$HOME/worldmodel/sam3/temporal_cross_view_assets_ratio_batch6"
-python qwen_temporal_runner.py \
-  --assets-root "$PWD" \
-  --work-dir "/scratch/users/ntu/gwang016/qwen35-4b/temporal_batch6_work_v2" \
+"$HOME/.conda/envs/sam3/bin/python" qwen_temporal_runner.py \
+  --assets-root "$EASY6" \
+  --work-dir "$WORK" \
   --render-only
 ```
 
