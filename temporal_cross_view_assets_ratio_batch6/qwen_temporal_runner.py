@@ -40,6 +40,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--case", action="append", default=[])
     parser.add_argument("--work-dir", type=Path)
+    parser.add_argument(
+        "--summary-path",
+        type=Path,
+        help=(
+            "Write this invocation's summary here. Defaults to "
+            "<assets-root>/batch_temporal_analysis_summary.json."
+        ),
+    )
     parser.add_argument("--render-only", action="store_true")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--max-new-tokens", type=int, default=320)
@@ -1603,7 +1611,12 @@ def main() -> None:
             }
             write_json(case_dir / "temporal_analysis_result.json", failure)
             summaries.append(failure)
-    write_json(root / "batch_temporal_analysis_summary.json", summaries)
+    summary_path = (
+        args.summary_path.resolve()
+        if args.summary_path
+        else root / "batch_temporal_analysis_summary.json"
+    )
+    write_json(summary_path, summaries)
     failed = [item for item in summaries if item["status"] == "failed"]
     print(
         f"\nCompleted {len(summaries)} cases; failed={len(failed)}",

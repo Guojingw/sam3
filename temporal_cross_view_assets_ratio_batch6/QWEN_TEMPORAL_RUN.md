@@ -49,6 +49,39 @@ qstat -u gwang016
 tail -f qwen4b_temporal_batch6.o*
 ```
 
+## Parallel one-GPU-per-case run
+
+Do not request multiple GPUs for one runner process. Submit one independent
+one-GPU job per case instead:
+
+```bash
+EASY6="/scratch/users/ntu/$USER/temporal_cross_view_assets_ratio_easy6"
+WORK="/scratch/users/ntu/$USER/qwen35-4b/temporal_easy6_parallel_v1"
+
+cd "$HOME/worldmodel/sam3/temporal_cross_view_assets_ratio_batch6"
+bash submit_qwen_temporal_parallel.sh "$EASY6" "$WORK"
+qstat -u "$USER"
+```
+
+Each job writes only its own case outputs, cache directory, and summary under
+`$WORK/job_summaries`. Do not run a serial job against the same work directory
+at the same time.
+
+After all jobs disappear from `qstat`, rebuild the complete six-case summary
+and render outputs without loading Qwen or requesting a GPU:
+
+```bash
+PYTHON="$HOME/.conda/envs/sam3/bin/python"
+
+"$PYTHON" qwen_temporal_runner.py \
+  --assets-root "$EASY6" \
+  --work-dir "$WORK" \
+  --render-only
+```
+
+Parallel execution reduces elapsed wall-clock time but consumes approximately
+the same total GPU-hours and is subject to project and queue concurrency limits.
+
 The frame evidence is saved under:
 
 ```text

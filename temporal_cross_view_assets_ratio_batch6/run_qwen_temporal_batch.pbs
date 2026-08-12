@@ -28,7 +28,18 @@ test -x "$PYTHON"
 test -f "$MODEL_DIR/config.json"
 nvidia-smi
 
-"$PYTHON" "$RUNNER_DIR/qwen_temporal_runner.py" \
-  --assets-root "$ASSETS" \
-  --model "$MODEL_DIR" \
+ARGS=(
+  --assets-root "$ASSETS"
+  --model "$MODEL_DIR"
   --work-dir "$WORK_DIR"
+)
+if [[ -n "${CASE_FILTER:-}" ]]; then
+  echo "case_filter=$CASE_FILTER"
+  ARGS+=(--case "$CASE_FILTER")
+fi
+if [[ -n "${SUMMARY_PATH:-}" ]]; then
+  echo "summary_path=$SUMMARY_PATH"
+  ARGS+=(--summary-path "$SUMMARY_PATH")
+fi
+
+"$PYTHON" "$RUNNER_DIR/qwen_temporal_runner.py" "${ARGS[@]}"
