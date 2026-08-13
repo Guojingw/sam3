@@ -7,6 +7,8 @@ import unittest
 import tempfile
 from pathlib import Path
 
+from PIL import Image
+
 import qwen_temporal_runner as runner
 
 
@@ -278,8 +280,58 @@ class TemporalSelectionTests(unittest.TestCase):
         self.assertIsNone(render_evidence[("cam01", 0)]["bbox_xyxy_normalized"])
         self.assertEqual(
             render_evidence[("cam01", 30)]["inference_kind"],
-            "window-verified",
+            "crop-verified",
         )
+
+    def test_candidate_identity_requires_two_cues_and_no_conflict(self) -> None:
+        accepted = runner.candidate_identity_check(
+            {
+                "same_object_type": True,
+                "candidate_crop_is_visually_verifiable": True,
+                "matched_visible_cues": ["green screw cap", "red bottle body"],
+                "conflicting_visible_cues": [],
+                "identity_confidence": 0.9,
+            }
+        )
+        color_only = runner.candidate_identity_check(
+            {
+                "same_object_type": True,
+                "candidate_crop_is_visually_verifiable": True,
+                "matched_visible_cues": ["red color"],
+                "conflicting_visible_cues": [],
+                "identity_confidence": 0.95,
+            }
+        )
+        conflicted = runner.candidate_identity_check(
+            {
+                "same_object_type": True,
+                "candidate_crop_is_visually_verifiable": True,
+                "matched_visible_cues": ["green cap", "red body"],
+                "conflicting_visible_cues": ["flat appliance control"],
+                "identity_confidence": 0.95,
+            }
+        )
+        self.assertTrue(accepted["identity_check_passed"])
+        self.assertFalse(color_only["identity_check_passed"])
+        self.assertFalse(conflicted["identity_check_passed"])
+
+    def test_candidate_panel_repeats_source_context_and_crop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            frame = root / "frame.jpg"
+            source = root / "source.png"
+            Image.new("RGB", (960, 540), (120, 80, 40)).save(frame)
+            Image.new("RGB", (300, 300), (180, 20, 20)).save(source)
+            panel_path = runner.make_candidate_identity_panel(
+                frame,
+                source,
+                [0.45, 0.40, 0.55, 0.60],
+                root,
+                "window",
+                30,
+            )
+            with Image.open(panel_path) as panel:
+                self.assertEqual(panel.size, (1760, 500))
 
 
 if __name__ == "__main__":

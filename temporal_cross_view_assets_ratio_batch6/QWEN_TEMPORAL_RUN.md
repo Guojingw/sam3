@@ -27,23 +27,28 @@ Qwen3.5 with 4B parameters; it does not mean a 3.5B model.
 9. Recheck each challenger using five time-distributed standalone full frames
    plus up to three strong scout frames. Do not use a compressed 3x3 contact
    sheet as a hard decision input. Qwen returns one presence and bbox result per
-   standalone frame; deterministic code derives the window-level decision.
-10. Prefer a generated 20% continuous window that captures the most evidence
+   standalone frame.
+10. Enlarge every proposed bbox into a candidate panel containing both local
+   context and the tight crop. Recompare it with the source-mask RGB anchor.
+   Require two visible identity-specific physical cues, no conflicting cue, and
+   reject crops too small or blurred to verify. Deterministic code derives the
+   window-level decision only after this second pass.
+11. Prefer a generated 20% continuous window that captures the most evidence
    from a localized occurrence. The target may be absent in surrounding window
    context when its true occurrence is shorter than 20%; this is the equivalent
    of padding the shorter side until the legal duration is reached.
-11. Rank legal windows by independently verified frame fraction (30%),
+12. Rank legal windows by independently verified frame fraction (30%),
    independent identity confidence (25%), occurrence capture (15%), box
    stability (10%), real-probe support (10%), visibility (5%), and source-time
    proximity (5%).
-12. Deterministically reject a window unless it captures at least two supported
-   localized scout samples, including one confirmed scout, and at least one
-   standalone full-frame verification supplies a valid target bbox. A positive
-   claim without localization is insufficient.
-13. Compare the winner with the best non-overlapping, equal-duration global
+13. Deterministically reject a window unless it captures at least two supported
+   localized scout samples and at least two enlarged candidate crops pass strict
+   cross-view identity verification. Color similarity and a positive claim
+   without localization are insufficient.
+14. Compare the winner with the best non-overlapping, equal-duration global
    challenger. Select the strongest verified continuous window or emit
    `uncertain`.
-14. Rewrite `temporal_analysis_result.json`, render the comparison image, and
+15. Rewrite `temporal_analysis_result.json`, render the comparison image, and
    update `batch_temporal_analysis_summary.json`.
 
 The synchronized source frame is a search origin, not a hard target frame. If
@@ -106,9 +111,10 @@ Use the new work directory shown above. Earlier frame caches used a different
 bbox coordinate system and window-verification schema and must not be mixed
 with this run.
 
-When upgrading from result schema 6 to schema 7, reuse the same work directory
-without `--force`. Frame scouts are reused; only the eight lightweight window
-verification calls per case are recomputed because their cache schema changed.
+When upgrading to result schema 8, reuse the same work directory without
+`--force`. Frame scouts are reused. The eight window localization calls and
+their strict candidate-crop identity checks are recomputed because the window
+verification cache schema changed.
 
 The frame evidence for the command above is saved under:
 

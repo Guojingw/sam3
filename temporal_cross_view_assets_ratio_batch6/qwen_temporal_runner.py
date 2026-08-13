@@ -22,8 +22,8 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 CASE_GLOB = "*__*"
 EVIDENCE_SCHEMA_VERSION = 4
-WINDOW_VERIFICATION_SCHEMA_VERSION = 5
-RESULT_SCHEMA_VERSION = 7
+WINDOW_VERIFICATION_SCHEMA_VERSION = 6
+RESULT_SCHEMA_VERSION = 8
 CONFIRMED_THRESHOLD = 0.50
 POSSIBLE_THRESHOLD = 0.45
 WINDOW_SUPPORT_FRACTION = 0.60
@@ -53,7 +53,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--render-only", action="store_true")
     parser.add_argument("--force", action="store_true")
-    parser.add_argument("--max-new-tokens", type=int, default=512)
+    parser.add_argument("--max-new-tokens", type=int, default=768)
     parser.add_argument(
         "--max-frame-probes-per-camera",
         type=int,
@@ -120,6 +120,41 @@ def model_bool(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"true", "yes", "1"}
     return bool(value)
+
+
+def normalize_string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def candidate_identity_check(raw: Mapping[str, Any]) -> dict[str, Any]:
+    """Require multiple visible identity cues, not a color-only resemblance."""
+    try:
+        confidence = max(
+            0.0, min(1.0, float(raw.get("identity_confidence", 0.0)))
+        )
+    except (TypeError, ValueError):
+        confidence = 0.0
+    matched_cues = normalize_string_list(raw.get("matched_visible_cues"))
+    conflicting_cues = normalize_string_list(raw.get("conflicting_visible_cues"))
+    accepted = bool(
+        model_bool(raw.get("same_object_type"))
+        and model_bool(raw.get("candidate_crop_is_visually_verifiable"))
+        and confidence >= 0.70
+        and len(matched_cues) >= 2
+        and not conflicting_cues
+    )
+    return {
+        "identity_check_passed": accepted,
+        "same_object_type": model_bool(raw.get("same_object_type")),
+        "candidate_crop_is_visually_verifiable": model_bool(
+            raw.get("candidate_crop_is_visually_verifiable")
+        ),
+        "matched_visible_cues": matched_cues,
+        "conflicting_visible_cues": conflicting_cues,
+        "identity_confidence": confidence if accepted else 0.0,
+    }
 
 
 def build_source_anchor(case_dir: Path, work_case: Path) -> dict[str, Any]:
@@ -322,6 +357,81 @@ def make_window_summary(
             font=font(18),
         )
     canvas.save(output, quality=96)
+    return output
+
+
+def make_candidate_identity_panel(
+    frame_path: Path,
+    source_anchor_path: Path,
+    box: Sequence[float],
+    work_case: Path,
+    window_id: str,
+    frame_id: int,
+) -> Path:
+    """Enlarge a proposed target without hiding its surrounding context."""
+    output_dir = work_case / "candidate_identity_panels_v2"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output = output_dir / f"{window_id}_{frame_id:06d}.jpg"
+    if output.exists():
+        return output
+
+    image = Image.open(frame_path).convert("RGB")
+    width, height = image.size
+    x1, y1, x2, y2 = box
+    left = max(0, min(width - 2, round(x1 * width)))
+    top = max(0, min(height - 2, round(y1 * height)))
+    right = max(left + 2, min(width, round(x2 * width)))
+    bottom = max(top + 2, min(height, round(y2 * height)))
+    pixel_box = (left, top, right, bottom)
+    box_width = max(2, pixel_box[2] - pixel_box[0])
+    box_height = max(2, pixel_box[3] - pixel_box[1])
+
+    tight_padding = max(4, round(max(box_width, box_height) * 0.20))
+    context_padding = max(48, round(max(box_width, box_height) * 2.5))
+
+    def expanded(padding: int) -> tuple[int, int, int, int]:
+        return (
+            max(0, pixel_box[0] - padding),
+            max(0, pixel_box[1] - padding),
+            min(width, pixel_box[2] + padding),
+            min(height, pixel_box[3] + padding),
+        )
+
+    context = ImageOps.contain(
+        image.crop(expanded(context_padding)),
+        (560, 430),
+        method=Image.Resampling.LANCZOS,
+    )
+    candidate = ImageOps.contain(
+        image.crop(expanded(tight_padding)),
+        (560, 430),
+        method=Image.Resampling.LANCZOS,
+    )
+    source_anchor = ImageOps.contain(
+        Image.open(source_anchor_path).convert("RGB"),
+        (540, 430),
+        method=Image.Resampling.LANCZOS,
+    )
+    panel = Image.new("RGB", (1760, 500), (238, 238, 234))
+    panel.paste(
+        source_anchor,
+        ((560 - source_anchor.width) // 2, 60 + (430 - source_anchor.height) // 2),
+    )
+    panel.paste(
+        context,
+        (600 + (560 - context.width) // 2, 60 + (430 - context.height) // 2),
+    )
+    panel.paste(
+        candidate,
+        (1200 + (560 - candidate.width) // 2, 60 + (430 - candidate.height) // 2),
+    )
+    draw = ImageDraw.Draw(panel)
+    draw.text((12, 16), "SOURCE MASK RGB ANCHOR", font=font(20), fill=(20, 25, 28))
+    draw.text((612, 16), f"frame {frame_id}: context", font=font(20), fill=(20, 25, 28))
+    draw.text((1212, 16), "PROPOSED OBJECT (ENLARGED)", font=font(20), fill=(20, 25, 28))
+    draw.line((580, 0, 580, 500), fill=(90, 94, 96), width=3)
+    draw.line((1180, 0, 1180, 500), fill=(90, 94, 96), width=3)
+    panel.save(output, quality=97)
     return output
 
 
@@ -1278,11 +1388,96 @@ return an overall presence decision; deterministic code will calculate it.
             frame_results.append(
                 {
                     "frame_id": frame_id,
-                    "presence": presence if accepted else "absent",
-                    "target_present": accepted,
+                    "presence": "candidate" if accepted else "absent",
+                    "preliminary_presence": presence,
+                    "preliminary_identity_confidence": (
+                        confidence if accepted else 0.0
+                    ),
+                    "target_present": False,
                     "bbox_xyxy_normalized": box if accepted else None,
-                    "identity_confidence": confidence if accepted else 0.0,
+                    "identity_confidence": 0.0,
+                    "identity_check_passed": False,
+                    "matched_visible_cues": [],
+                    "conflicting_visible_cues": [],
                 }
+            )
+        proposed = [
+            item for item in frame_results if item["bbox_xyxy_normalized"]
+        ]
+        crop_raw: Mapping[str, Any] = {"frames": []}
+        if proposed:
+            panels = [
+                make_candidate_identity_panel(
+                    catalog[(window["cam"], int(item["frame_id"]))],
+                    anchor["isolated_path"],
+                    item["bbox_xyxy_normalized"],
+                    work_case,
+                    window_id,
+                    int(item["frame_id"]),
+                )
+                for item in proposed
+            ]
+            panel_map = [
+                {"image_number": index + 1, "frame_id": item["frame_id"]}
+                for index, item in enumerate(proposed)
+            ]
+            crop_prompt = f"""
+Perform strict cross-view identity verification for proposed object crops.
+
+Every image is a self-contained three-column comparison. LEFT repeats the
+first-person source-mask RGB anchor, CENTER shows third-person context, and
+RIGHT shows the proposed bbox crop enlarged without changing its pixels.
+Mapping:
+{json.dumps(panel_map, ensure_ascii=False)}
+
+Authoritative source identity:
+{json.dumps(identity, ensure_ascii=False)}
+
+Evaluate the enlarged RIGHT crop in every proposal. Color similarity alone is
+never sufficient. Require at least two distinct, directly visible physical
+cues such as shape, part arrangement, cap/handle/rim structure, material, or
+label geometry. A color patch, reflection, utensil, appliance control, hand, or
+background item is not the masked object. If the crop is too tiny, blurred, or
+incomplete to verify those cues, set
+candidate_crop_is_visually_verifiable=false. List any visible feature that
+conflicts with the source. Do not trust the earlier bbox.
+
+Return JSON only with exactly one entry per mapped frame:
+{{
+  "frames": [
+    {{
+      "frame_id": {proposed[0]['frame_id']},
+      "candidate_crop_is_visually_verifiable": false,
+      "same_object_type": false,
+      "matched_visible_cues": [],
+      "conflicting_visible_cues": [],
+      "identity_confidence": 0.0
+    }}
+  ]
+}}
+"""
+            response = qwen.ask(
+                panels,
+                crop_prompt,
+            )
+            if isinstance(response, dict):
+                crop_raw = response
+        crop_returned = {}
+        for item in crop_raw.get("frames", []):
+            if not isinstance(item, dict) or item.get("frame_id") is None:
+                continue
+            try:
+                crop_returned[int(item["frame_id"])] = item
+            except (TypeError, ValueError):
+                continue
+        for item in proposed:
+            identity_check = candidate_identity_check(
+                crop_returned.get(int(item["frame_id"]), {})
+            )
+            item.update(identity_check)
+            item["target_present"] = identity_check["identity_check_passed"]
+            item["presence"] = (
+                "confirmed" if item["target_present"] else "rejected_candidate"
             )
         positives = [item for item in frame_results if item["target_present"]]
         representative = max(
@@ -1306,7 +1501,7 @@ return an overall presence decision; deterministic code will calculate it.
             "target_in_end": any(
                 item["target_present"] for item in frame_results[-thirds:]
             ),
-            "contains_target_occurrence": bool(positives),
+            "contains_target_occurrence": len(positives) >= 2,
             "visible_summary_position_count": len(positives),
             "first_visible_frame_id": (
                 positives[0]["frame_id"] if positives else None
@@ -1328,9 +1523,10 @@ return an overall presence decision; deterministic code will calculate it.
                 else 0.0
             ),
             "reason": (
-                f"Independent full-frame matches: {len(positives)}/{len(frame_results)}."
+                f"Crop-verified identity matches: {len(positives)}/{len(frame_results)}."
             ),
-            "raw_model_response": raw,
+            "raw_full_frame_response": raw,
+            "raw_candidate_crop_response": crop_raw,
         }
         write_json(cache_path, cached)
     return cached
@@ -1364,7 +1560,7 @@ def analyze_windows(
         verification_ok = bool(
             verification
             and verification.get("contains_target_occurrence")
-            and int(verification.get("visible_summary_position_count", 0)) >= 1
+            and int(verification.get("visible_summary_position_count", 0)) >= 2
             and verification.get("representative_frame_id")
             in window["frame_ids"]
             and verification.get("representative_bbox_xyxy_normalized")
@@ -1512,6 +1708,9 @@ def analyze_windows(
             "preferred_window_ratio": 0.20,
             "minimum_captured_supported_frames": 2,
             "minimum_captured_confirmed_frames": 1,
+            "minimum_crop_verified_identity_frames": 2,
+            "minimum_visible_identity_cues_per_verified_crop": 2,
+            "conflicting_identity_cues_allowed": False,
             "window_must_overlap_confirmed_occurrence": True,
             "target_may_be_absent_in_window_context": True,
             "occurrence_qwen_verification_required": True,
@@ -1544,7 +1743,7 @@ def analyze_windows(
     if not selected:
         result["uncertainty"] = (
             "No generated 20%-30% continuous window contains at least two "
-            "localized scout samples and one independently verified full-frame match."
+            "localized scouts and two independently crop-verified identity matches."
         )
         result["confidence"] = round(
             max((entry[2]["overall"] for entry in candidates), default=0.0), 4
@@ -1572,7 +1771,7 @@ def analyze_windows(
             "frame_id": item["frame_id"],
             "target_region_xyxy": item["bbox_xyxy_normalized"],
             "visibility": 1.0,
-            "occlusion": "independently_verified",
+            "occlusion": "crop_verified",
             "identity_confidence": item["identity_confidence"],
             "model_presence": item["presence"],
             "evidence_score": item["identity_confidence"],
@@ -1632,7 +1831,7 @@ def analyze_windows(
             "coordinate_system": "normalized_xyxy_per_frame",
             "stable_region_xyxy": stable,
             "region_explanation": (
-                "Median of independently rechecked standalone-frame boxes; "
+                "Median of independently enlarged-and-crop-verified boxes; "
                 "boxes are localization evidence, not masks."
             ),
         },
@@ -1859,7 +2058,7 @@ def verified_render_evidence(
     evidence: list[dict[str, Any]],
     window_verifications: Mapping[str, Mapping[str, Any]],
 ) -> dict[tuple[str, int], dict[str, Any]]:
-    """Render only boxes independently rechecked as standalone full frames."""
+    """Render only boxes that passed enlarged candidate-crop identity checks."""
     output: dict[tuple[str, int], dict[str, Any]] = {}
     for item in evidence:
         cleared = dict(item)
@@ -1884,7 +2083,7 @@ def verified_render_evidence(
             confidence = float(item.get("identity_confidence", 0.0))
             previous = output[key]
             if (
-                previous.get("inference_kind") == "window-verified"
+                previous.get("inference_kind") == "crop-verified"
                 and float(previous.get("identity_confidence", 0.0)) >= confidence
             ):
                 continue
@@ -1896,7 +2095,7 @@ def verified_render_evidence(
                     "visibility": 1.0,
                     "identity_confidence": confidence,
                     "evidence_score": confidence,
-                    "inference_kind": "window-verified",
+                    "inference_kind": "crop-verified",
                 }
             )
     return output
@@ -2088,11 +2287,28 @@ def render_result(
         )
         or "none confirmed"
     )
+    crop_verified = []
+    if best:
+        verification = best.get("scores", {}).get("occurrence_verification") or {}
+        crop_verified = [
+            item
+            for item in verification.get("frame_results", [])
+            if item.get("target_present")
+        ]
+    cue_text = (
+        "; ".join(
+            f"frame {item['frame_id']}: "
+            + ", ".join(item.get("matched_visible_cues", [])[:2])
+            for item in crop_verified[:2]
+        )
+        or "none"
+    )
     footer = [
-        f"Confirmed occurrence spans: {run_text}",
+        f"Scout occurrence spans: {run_text}",
+        f"Strict crop-verified cues: {cue_text}",
         "Decision rule: prefer a continuous 20% window that captures the most "
-        "localized occurrence evidence; target may be absent in surrounding "
-        "context; at least two supported and one confirmed sample required.",
+        "localized occurrence evidence; require at least two enlarged crops "
+        "matching two identity-specific cues with no visible conflict.",
         f"Uncertainty: {result.get('uncertainty') or 'none'}",
         "Cyan boxes are Qwen localization evidence, not masks. Overlay colors are never used as object colors.",
     ]
