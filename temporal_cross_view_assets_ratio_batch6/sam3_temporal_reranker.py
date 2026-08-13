@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import math
 import shutil
+import sys
 import traceback
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -18,6 +19,7 @@ import qwen_temporal_runner as temporal
 
 RERANK_SCHEMA_VERSION = 1
 RESULT_SCHEMA_VERSION = 12
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
 def parse_args() -> argparse.Namespace:
@@ -518,6 +520,9 @@ def main() -> None:
             evidence = temporal.read_json(work_case / "qwen_frame_evidence.json")
             temporal.render_result(case_dir, work_case, result, evidence, catalog, index)
         return
+
+    if str(REPOSITORY_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPOSITORY_ROOT))
 
     import torch
     from sam3.model_builder import build_sam3_video_predictor

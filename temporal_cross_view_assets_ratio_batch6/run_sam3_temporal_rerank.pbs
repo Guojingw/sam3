@@ -16,6 +16,7 @@ PYTHON="$HOME/.conda/envs/sam3/bin/python"
 
 export HF_HOME="${HF_HOME:-$HOME/scratch/hf_cache}"
 export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
+export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
 
 cd "$RUNNER_DIR"
 nvidia-smi

@@ -52,6 +52,11 @@ def track(window_id: str, evidence: float, coverage: float) -> dict:
 
 
 class Sam3RerankerTests(unittest.TestCase):
+    def test_repository_root_contains_sam3_package(self) -> None:
+        self.assertTrue(
+            (reranker.REPOSITORY_ROOT / "sam3" / "model_builder.py").is_file()
+        )
+
     def test_mask_bbox_uses_mask_pixels(self) -> None:
         mask = np.zeros((10, 20), dtype=bool)
         mask[2:8, 5:15] = True
