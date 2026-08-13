@@ -22,8 +22,8 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 CASE_GLOB = "*__*"
 EVIDENCE_SCHEMA_VERSION = 5
-WINDOW_VERIFICATION_SCHEMA_VERSION = 7
-RESULT_SCHEMA_VERSION = 9
+WINDOW_VERIFICATION_SCHEMA_VERSION = 8
+RESULT_SCHEMA_VERSION = 10
 CONFIRMED_THRESHOLD = 0.50
 POSSIBLE_THRESHOLD = 0.45
 WINDOW_SUPPORT_FRACTION = 0.60
@@ -118,6 +118,47 @@ def normalized_box(value: Any) -> list[float] | None:
     return box
 
 
+def bounded_score(value: Any) -> float:
+    try:
+        return max(0.0, min(1.0, float(value)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def normalized_box_area(box: Sequence[float] | None) -> float:
+    if not box:
+        return 0.0
+    return max(0.0, float(box[2]) - float(box[0])) * max(
+        0.0, float(box[3]) - float(box[1])
+    )
+
+
+def presentation_metrics(
+    raw: Mapping[str, Any], box: Sequence[float] | None
+) -> dict[str, Any]:
+    completeness = bounded_score(raw.get("object_completeness"))
+    tightness = bounded_score(raw.get("bbox_tightness"))
+    fill = bounded_score(raw.get("object_fill_fraction_in_bbox"))
+    frame_fraction = normalized_box_area(box) * fill
+    localization_passed = bool(
+        box
+        and tightness >= 0.40
+        and fill >= 0.18
+        and normalized_box_area(box) <= 0.75
+    )
+    return {
+        "localization_check_passed": localization_passed,
+        "object_completeness": completeness,
+        "bbox_tightness": tightness,
+        "object_fill_fraction_in_bbox": fill,
+        "estimated_target_frame_fraction": frame_fraction,
+        "target_scale_score": min(1.0, math.sqrt(frame_fraction / 0.12)),
+        "presentation_quality": (
+            0.40 * completeness + 0.35 * tightness + 0.25 * fill
+        ),
+    }
+
+
 def model_bool(value: Any) -> bool:
     if isinstance(value, bool):
         return value
@@ -132,7 +173,9 @@ def normalize_string_list(value: Any) -> list[str]:
     return [str(item).strip() for item in value if str(item).strip()]
 
 
-def candidate_identity_check(raw: Mapping[str, Any]) -> dict[str, Any]:
+def candidate_identity_check(
+    raw: Mapping[str, Any], box: Sequence[float] | None = None
+) -> dict[str, Any]:
     """Require multiple visible identity cues, not a color-only resemblance."""
     try:
         confidence = max(
@@ -158,6 +201,7 @@ def candidate_identity_check(raw: Mapping[str, Any]) -> dict[str, Any]:
         "matched_visible_cues": matched_cues,
         "conflicting_visible_cues": conflicting_cues,
         "identity_confidence": confidence if accepted else 0.0,
+        **presentation_metrics(raw, box),
     }
 
 
@@ -526,18 +570,23 @@ def make_spatial_tile_panels(
     work_case: Path,
     window_id: str,
     frame_id: int,
-) -> tuple[list[Path], dict[str, list[float]]]:
+) -> tuple[list[Path], dict[str, list[float]], dict[str, Path]]:
     output_dir = work_case / "spatial_tile_panels_v1" / window_id
+    crop_dir = work_case / "spatial_tile_crops_v1" / window_id
     output_dir.mkdir(parents=True, exist_ok=True)
+    crop_dir.mkdir(parents=True, exist_ok=True)
     frame = Image.open(frame_path).convert("RGB")
     source = Image.open(source_anchor_path).convert("RGB")
     tile_map: dict[str, list[float]] = {}
+    crop_map: dict[str, Path] = {}
     paths: list[Path] = []
     for tile_id, box in spatial_tile_boxes():
         tile_map[tile_id] = box
         output = output_dir / f"frame_{frame_id:06d}_{tile_id}.jpg"
+        crop_output = crop_dir / f"frame_{frame_id:06d}_{tile_id}.jpg"
+        crop_map[tile_id] = crop_output
         paths.append(output)
-        if output.exists():
+        if output.exists() and crop_output.exists():
             continue
         width, height = frame.size
         pixel_box = (
@@ -549,8 +598,10 @@ def make_spatial_tile_panels(
         anchor = ImageOps.contain(
             source, (500, 430), method=Image.Resampling.LANCZOS
         )
+        raw_tile = frame.crop(pixel_box)
+        raw_tile.save(crop_output, quality=100, subsampling=0)
         tile = ImageOps.contain(
-            frame.crop(pixel_box), (500, 430), method=Image.Resampling.LANCZOS
+            raw_tile, (500, 430), method=Image.Resampling.LANCZOS
         )
         panel = Image.new("RGB", (1080, 500), (238, 238, 234))
         panel.paste(
@@ -576,7 +627,7 @@ def make_spatial_tile_panels(
         )
         draw.line((540, 0, 540, 500), fill=(90, 94, 96), width=3)
         panel.save(output, quality=97)
-    return paths, tile_map
+    return paths, tile_map, crop_map
 
 
 def tile_rescue_frame(
@@ -589,7 +640,7 @@ def tile_rescue_frame(
     frame_id: int,
 ) -> tuple[dict[str, Any] | None, Any]:
     """Search enlarged overlapping regions after full-frame localization fails."""
-    panels, tile_map = make_spatial_tile_panels(
+    panels, tile_map, crop_map = make_spatial_tile_panels(
         frame_path,
         anchor["isolated_path"],
         work_case,
@@ -643,12 +694,49 @@ Return JSON only:
     if tile_id not in tile_map:
         return None, {"search": search_raw, "verification": None}
     search_check = candidate_identity_check(candidate)
-    box = map_tile_box_to_frame(
-        tile_map[tile_id],
-        candidate.get("bbox_xyxy_normalized_within_tile"),
-    )
-    if not search_check["identity_check_passed"] or box is None:
+    if not search_check["identity_check_passed"]:
         return None, {"search": search_raw, "verification": None}
+
+    localization_prompt = f"""
+Image 1 is the authoritative first-person masked RGB object. Image 2 is one
+enlarged third-person tile known to contain a candidate.
+
+Target identity:
+{json.dumps(identity, ensure_ascii=False)}
+
+Locate the complete visible target in image 2. Return a TIGHT bounding box
+around the target pixels, including all visible target parts but excluding
+people, deck/floor, and surrounding background. Never return the whole image
+or the tile boundaries merely because the target is somewhere inside. If a
+tight box cannot be determined, return null.
+
+Return JSON only:
+{{
+  "bbox_xyxy_normalized": null,
+  "object_completeness": 0.0,
+  "bbox_tightness": 0.0,
+  "object_fill_fraction_in_bbox": 0.0
+}}
+"""
+    localization_raw = qwen.ask(
+        [anchor["isolated_path"], crop_map[tile_id]], localization_prompt
+    )
+    local_box = (
+        normalized_box(localization_raw.get("bbox_xyxy_normalized"))
+        if isinstance(localization_raw, dict)
+        else None
+    )
+    local_metrics = presentation_metrics(
+        localization_raw if isinstance(localization_raw, dict) else {},
+        local_box,
+    )
+    box = map_tile_box_to_frame(tile_map[tile_id], local_box)
+    if box is None or not local_metrics["localization_check_passed"]:
+        return None, {
+            "search": search_raw,
+            "localization": localization_raw,
+            "verification": None,
+        }
 
     verification_panel = make_candidate_identity_panel(
         frame_path,
@@ -670,6 +758,9 @@ Authoritative source identity:
 Color alone is insufficient. Require at least two directly visible physical
 cues and no conflicting cue. If tiny, blurred, incomplete, or a nearby object,
 set candidate_crop_is_visually_verifiable=false.
+Score object_completeness, bbox_tightness, and object_fill_fraction_in_bbox
+independently from identity; a box containing substantial background must have
+low tightness and fill scores.
 
 Return JSON only:
 {{
@@ -677,15 +768,26 @@ Return JSON only:
   "same_object_type": false,
   "matched_visible_cues": [],
   "conflicting_visible_cues": [],
-  "identity_confidence": 0.0
+  "identity_confidence": 0.0,
+  "object_completeness": 0.0,
+  "bbox_tightness": 0.0,
+  "object_fill_fraction_in_bbox": 0.0
 }}
 """
     verification_raw = qwen.ask([verification_panel], verification_prompt)
     if not isinstance(verification_raw, dict):
-        return None, {"search": search_raw, "verification": verification_raw}
-    check = candidate_identity_check(verification_raw)
-    raw = {"search": search_raw, "verification": verification_raw}
-    if not check["identity_check_passed"]:
+        return None, {
+            "search": search_raw,
+            "localization": localization_raw,
+            "verification": verification_raw,
+        }
+    check = candidate_identity_check(verification_raw, box)
+    raw = {
+        "search": search_raw,
+        "localization": localization_raw,
+        "verification": verification_raw,
+    }
+    if not check["identity_check_passed"] or not check["localization_check_passed"]:
         return None, raw
     return {
         "frame_id": frame_id,
@@ -1714,6 +1816,13 @@ incomplete to verify those cues, set
 candidate_crop_is_visually_verifiable=false. List any visible feature that
 conflicts with the source. Do not trust the earlier bbox.
 
+Also score the proposed box itself. object_completeness is the fraction of the
+visible target included by the box. bbox_tightness is high only when the box
+closely follows the target extents without excess background.
+object_fill_fraction_in_bbox is the fraction of pixels inside the box occupied
+by the target. These are independent 0-1 scores; do not inflate them to support
+an identity decision.
+
 Return JSON only with exactly one entry per mapped frame:
 {{
   "frames": [
@@ -1723,7 +1832,10 @@ Return JSON only with exactly one entry per mapped frame:
       "same_object_type": false,
       "matched_visible_cues": [],
       "conflicting_visible_cues": [],
-      "identity_confidence": 0.0
+      "identity_confidence": 0.0,
+      "object_completeness": 0.0,
+      "bbox_tightness": 0.0,
+      "object_fill_fraction_in_bbox": 0.0
     }}
   ]
 }}
@@ -1744,10 +1856,14 @@ Return JSON only with exactly one entry per mapped frame:
                 continue
         for item in proposed:
             identity_check = candidate_identity_check(
-                crop_returned.get(int(item["frame_id"]), {})
+                crop_returned.get(int(item["frame_id"]), {}),
+                item["bbox_xyxy_normalized"],
             )
             item.update(identity_check)
-            item["target_present"] = identity_check["identity_check_passed"]
+            item["target_present"] = bool(
+                identity_check["identity_check_passed"]
+                and identity_check["localization_check_passed"]
+            )
             item["presence"] = (
                 "confirmed" if item["target_present"] else "rejected_candidate"
             )
@@ -1857,6 +1973,37 @@ Return JSON only with exactly one entry per mapped frame:
     return cached
 
 
+def verification_presentation_scores(
+    verification: Mapping[str, Any] | None,
+) -> dict[str, float]:
+    verified = [
+        item
+        for item in (verification or {}).get("frame_results", [])
+        if item.get("target_present") and item.get("localization_check_passed")
+    ]
+    if not verified:
+        return {
+            "mean_presentation_quality": 0.0,
+            "mean_target_scale_score": 0.0,
+            "mean_estimated_target_frame_fraction": 0.0,
+            "mean_bbox_tightness": 0.0,
+            "mean_object_completeness": 0.0,
+        }
+
+    def mean(key: str) -> float:
+        return statistics.mean(float(item.get(key, 0.0)) for item in verified)
+
+    return {
+        "mean_presentation_quality": mean("presentation_quality"),
+        "mean_target_scale_score": mean("target_scale_score"),
+        "mean_estimated_target_frame_fraction": mean(
+            "estimated_target_frame_fraction"
+        ),
+        "mean_bbox_tightness": mean("bbox_tightness"),
+        "mean_object_completeness": mean("object_completeness"),
+    }
+
+
 def analyze_windows(
     metadata: Mapping[str, Any],
     temporal_index: Mapping[str, Any],
@@ -1901,18 +2048,20 @@ def analyze_windows(
             (verification or {}).get("visible_summary_position_count", 0)
         ) / max(1, len((verification or {}).get("verified_frame_ids", [])))
         score["verification_frame_fraction"] = verification_frame_fraction
+        score.update(verification_presentation_scores(verification))
         if verification:
             score["overall"] = (
                 0.80 * score["overall"]
                 + 0.20 * verification_identity
             )
         score["selection_score"] = (
-            0.30 * verification_frame_fraction
-            + 0.25 * verification_identity
+            0.10 * verification_frame_fraction
+            + 0.20 * verification_identity
             + 0.15 * score["captured_occurrence_fraction"]
-            + 0.10 * score["bbox_temporal_stability"]
-            + 0.10 * score["real_probe_support_fraction"]
-            + 0.05 * score["mean_visibility"]
+            + 0.20 * score["mean_presentation_quality"]
+            + 0.20 * score["mean_target_scale_score"]
+            + 0.05 * score["bbox_temporal_stability"]
+            + 0.05 * score["real_probe_support_fraction"]
             + 0.05 * score["source_frame_temporal_prior"]
         )
         score["valid"] = bool(
@@ -2046,12 +2195,13 @@ def analyze_windows(
             "preferred_ratio": 0.20,
             "candidate_comparison": "equal-duration temporal bins per camera",
             "ranking_weights": {
-                "independently_verified_frame_fraction": 0.30,
-                "window_identity_verification": 0.25,
+                "independently_verified_frame_fraction": 0.10,
+                "window_identity_verification": 0.20,
                 "captured_occurrence_fraction": 0.15,
-                "bbox_temporal_stability": 0.10,
-                "real_probe_support_fraction": 0.10,
-                "mean_visibility": 0.05,
+                "mean_presentation_quality": 0.20,
+                "mean_target_scale_score": 0.20,
+                "bbox_temporal_stability": 0.05,
+                "real_probe_support_fraction": 0.05,
                 "source_frame_temporal_prior": 0.05,
             },
         },
@@ -2172,6 +2322,19 @@ def analyze_windows(
             "bbox_temporal_stability": round(
                 score["bbox_temporal_stability"], 4
             ),
+            "mean_presentation_quality": round(
+                score["mean_presentation_quality"], 4
+            ),
+            "mean_target_scale_score": round(
+                score["mean_target_scale_score"], 4
+            ),
+            "mean_estimated_target_frame_fraction": round(
+                score["mean_estimated_target_frame_fraction"], 4
+            ),
+            "mean_bbox_tightness": round(score["mean_bbox_tightness"], 4),
+            "mean_object_completeness": round(
+                score["mean_object_completeness"], 4
+            ),
             "occurrence_verification": score["window_verification"],
             "selection_score": round(score["selection_score"], 4),
             "overall": round(score["overall"], 4),
@@ -2246,13 +2409,15 @@ def draw_frame_panel(
         )
         draw.rectangle(box, outline=(0, 230, 170), width=5)
     frame_id = evidence.get("frame_id") if evidence else "?"
-    presence = evidence.get("model_presence", "absent") if evidence else "absent"
     inference_kind = evidence.get("inference_kind", "qwen") if evidence else "none"
-    draw.rectangle((0, 0, 245, 27), fill=(15, 21, 25))
+    classification = (
+        "verified" if inference_kind == "crop-verified" else "unverified"
+    )
+    draw.rectangle((0, 0, 245, 38), fill=(15, 21, 25))
     draw.text(
-        (7, 5),
-        f"frame {frame_id} | {presence} | {inference_kind}",
-        font=font(14),
+        (9, 6),
+        f"frame {frame_id} | {classification}",
+        font=font(20),
         fill="white",
     )
     return panel
@@ -2469,46 +2634,7 @@ def render_result(
 ) -> None:
     output_dir = case_dir / "analysis_outputs"
     output_dir.mkdir(parents=True, exist_ok=True)
-    canvas = Image.new("RGB", (1800, 1120), (246, 243, 234))
-    draw = ImageDraw.Draw(canvas)
-    title_font, body_font, small_font = font(32), font(20), font(16)
-    target = clean_target_name(str(result["target_object"]))
     best = result.get("best_segment")
-    window_text = best["window_id"] if best else "NONE (uncertain)"
-    range_text = (
-        f"{best['start_frame']}-{best['end_frame']}" if best else "NONE"
-    )
-    lines = [
-        f"Mask-anchored temporal analysis: {target}",
-        f"Source mask: {result['source_best_mask']} | source frame: {result['source_best_frame']}",
-        f"Selected window_id: {window_text} | frame range: {range_text}",
-        f"Status: {result['status']} | object: {result['source_identity'].get('object_identity', target)}",
-    ]
-    for row, line in enumerate(lines):
-        draw.text(
-            (35, 25 + row * 39),
-            line,
-            font=title_font if row == 0 else body_font,
-            fill=(20, 27, 31),
-        )
-
-    source_panel = fit_image(
-        Image.open(work_case / "source_anchor_isolated_rgb.png"), (360, 360)
-    )
-    canvas.paste(source_panel, (35, 205))
-    draw.text(
-        (35, 575),
-        "SOURCE MASK RGB ANCHOR",
-        font=body_font,
-        fill=(20, 27, 31),
-    )
-    signature = str(result["source_identity"].get("visual_signature", ""))
-    wrapped = textwrap.wrap(signature, width=43)[:8]
-    for row, line in enumerate(wrapped):
-        draw.text(
-            (35, 612 + row * 24), line, font=small_font, fill=(45, 51, 54)
-        )
-
     evidence_map = verified_render_evidence(
         evidence, result.get("window_verifications", {})
     )
@@ -2520,131 +2646,87 @@ def render_result(
         temporal_index,
         work_case,
     )
-    selected_items: list[dict[str, Any]] = []
+    windows_by_id = {
+        str(window["window_id"]): window for window in all_windows(temporal_index)
+    }
+    selected_items: list[Mapping[str, Any]] = []
+    selected_window: Mapping[str, Any] | None = None
     if best:
-        window = next(
-            item
-            for item in all_windows(temporal_index)
-            if item["window_id"] == best["window_id"]
-        )
-        selected_items = window_display_items(window, evidence_map)
+        selected_window = windows_by_id[str(best["window_id"])]
+        selected_items = window_display_items(selected_window, evidence_map)
     else:
         selected_items = timeline_bin_samples(evidence, 5, highest=True)
 
-    evidence_heading = (
-        (
-            f"CONTINUOUS SELECTED WINDOW {best['start_frame']}-{best['end_frame']} "
-            "(ENDPOINTS + OBJECT EVIDENCE)"
-        )
-        if best
-        else "TIMELINE EVIDENCE (NO WINDOW SELECTED)"
+    comparison: list[Mapping[str, Any]] = []
+    comparison_window: Mapping[str, Any] | None = None
+    challenger_id = (result.get("global_challenger_comparison") or {}).get(
+        "challenger_window_id"
     )
-    draw.text(
-        (445, 180),
-        evidence_heading,
-        font=body_font,
-        fill=(20, 27, 31),
-    )
-    for index, item in enumerate(selected_items[:5]):
-        path = catalog[(item["cam"], item["frame_id"])]
-        panel = draw_frame_panel(path, item, (255, 180))
-        x = 445 + (index % 5) * 265
-        canvas.paste(panel, (x, 215))
-
-    comparison = []
+    if challenger_id in windows_by_id:
+        comparison_window = windows_by_id[str(challenger_id)]
     meaningful_rejected = [
         segment
         for segment in result.get("rejected_segments", [])
         if float(segment.get("scores", {}).get("overall", 0.0)) > 0.0
     ]
-    if meaningful_rejected:
-        if best:
-            best_midpoint = (best["start_frame"] + best["end_frame"]) / 2
-            rejected_segment = max(
-                meaningful_rejected,
-                key=lambda segment: abs(
-                    (segment["start_frame"] + segment["end_frame"]) / 2
-                    - best_midpoint
-                ),
-            )
-        else:
-            rejected_segment = meaningful_rejected[0]
-        rejected_id = rejected_segment["window_id"]
-        rejected_window = next(
-            item
-            for item in all_windows(temporal_index)
-            if item["window_id"] == rejected_id
+    if comparison_window is None and meaningful_rejected:
+        rejected_segment = max(
+            meaningful_rejected,
+            key=lambda segment: float(
+                segment.get("scores", {}).get("selection_score", 0.0)
+            ),
         )
-        comparison = window_display_items(rejected_window, evidence_map)
-        verification = rejected_segment.get("scores", {}).get(
-            "window_verification"
-        ) or {}
-        candidate_kind = (
-            "ALTERNATIVE OCCURRENCE WINDOW"
-            if verification.get("contains_target_occurrence")
-            else "UNSELECTED COMPARISON WINDOW"
-        )
-        comparison_label = (
-            f"{candidate_kind}: {rejected_id} "
-            f"({rejected_window['start_frame']}-{rejected_window['end_frame']})"
-        )
+        comparison_window = windows_by_id.get(str(rejected_segment["window_id"]))
+    if comparison_window is not None:
+        comparison = window_display_items(comparison_window, evidence_map)
     else:
         comparison = timeline_bin_samples(evidence, 5, highest=False)
-        comparison_label = "COMPARISON: lowest-evidence samples across full timeline"
-    draw.text(
-        (445, 435),
-        comparison_label,
-        font=body_font,
-        fill=(20, 27, 31),
-    )
-    for index, item in enumerate(comparison[:5]):
-        path = catalog[(item["cam"], item["frame_id"])]
-        panel = draw_frame_panel(path, item, (255, 180))
-        x = 445 + (index % 5) * 265
-        canvas.paste(panel, (x, 470))
 
-    draw.line((35, 845, 1765, 845), fill=(155, 151, 141), width=2)
-    runs = result.get("occurrence_spans", [])
-    run_text = (
-        ", ".join(
-            f"{run['cam']}:{run['first_confirmed_frame']}-{run['last_confirmed_frame']}"
-            for run in runs
-        )
-        or "none confirmed"
+    canvas = Image.new("RGB", (3200, 1180), (246, 243, 234))
+    draw = ImageDraw.Draw(canvas)
+    heading_font = font(28)
+    source_heading = (
+        f"SOURCE MASK | {result['source_best_mask']} | "
+        f"frame {result['source_best_frame']}"
     )
-    crop_verified = []
-    if best:
-        verification = best.get("scores", {}).get("occurrence_verification") or {}
-        crop_verified = [
-            item
-            for item in verification.get("frame_results", [])
-            if item.get("target_present")
-        ]
-    cue_text = (
-        "; ".join(
-            f"frame {item['frame_id']}: "
-            + ", ".join(item.get("matched_visible_cues", [])[:2])
-            for item in crop_verified[:2]
-        )
-        or "none"
+    draw.text((45, 32), source_heading, font=heading_font, fill=(20, 27, 31))
+    source_panel = fit_image(
+        Image.open(work_case / "source_anchor_isolated_rgb.png"), (520, 520)
     )
-    footer = [
-        f"Scout occurrence spans: {run_text}",
-        f"Strict crop-verified cues: {cue_text}",
-        "Decision rule: prefer a continuous 20% window that captures the most "
-        "localized occurrence evidence; require at least two enlarged crops "
-        "matching two identity-specific cues with no visible conflict.",
-        f"Uncertainty: {result.get('uncertainty') or 'none'}",
-        "Cyan boxes are Qwen localization evidence, not masks. Overlay colors are never used as object colors.",
-    ]
-    y = 870
-    for line in footer:
-        for wrapped_line in textwrap.wrap(line, width=145):
-            draw.text((35, y), wrapped_line, font=small_font, fill=(35, 41, 44))
-            y += 25
-        y += 7
+    canvas.paste(source_panel, (45, 100))
+
+    if selected_window is not None:
+        selected_label = (
+            f"SELECTED | {selected_window['window_id']} | frames "
+            f"{selected_window['start_frame']}-{selected_window['end_frame']}"
+        )
+    else:
+        selected_label = "SELECTED | NONE | uncertain"
+    draw.text((610, 32), selected_label, font=heading_font, fill=(20, 27, 31))
+
+    panel_size = (490, 300)
+    for index, item in enumerate(selected_items[:5]):
+        path = catalog[(item["cam"], int(item["frame_id"]))]
+        panel = draw_frame_panel(path, item, panel_size)
+        canvas.paste(panel, (610 + index * 505, 85))
+
+    if comparison_window is not None:
+        comparison_label = (
+            f"ALTERNATIVE | {comparison_window['window_id']} | frames "
+            f"{comparison_window['start_frame']}-{comparison_window['end_frame']}"
+        )
+    else:
+        comparison_label = "ALTERNATIVE | timeline comparison"
+    draw.text((610, 570), comparison_label, font=heading_font, fill=(20, 27, 31))
+    for index, item in enumerate(comparison[:5]):
+        path = catalog[(item["cam"], int(item["frame_id"]))]
+        panel = draw_frame_panel(path, item, panel_size)
+        canvas.paste(panel, (610 + index * 505, 625))
+
     output = output_dir / "selected_vs_rejected_region_comparison.jpg"
-    canvas.save(output, quality=96)
+    canvas.save(output, quality=100, subsampling=0)
+    png_output = output.with_suffix(".png")
+    canvas.save(png_output, compress_level=3)
     write_json(
         output_dir / "render_summary.json",
         {
@@ -2657,6 +2739,11 @@ def render_result(
             ),
             "selected_contact_sheet": selected_sheet.name,
             "comparison_image": output.name,
+            "comparison_png": png_output.name,
+            "comparison_image_size": [canvas.width, canvas.height],
+            "alternative_window_id": (
+                comparison_window["window_id"] if comparison_window else None
+            ),
             "visual_check": "pending_human_review",
         },
     )

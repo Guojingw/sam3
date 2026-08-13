@@ -33,19 +33,22 @@ Qwen3.5 with 4B parameters; it does not mean a 3.5B model.
    context and the tight crop. Recompare it with the source-mask RGB anchor.
    Require two visible identity-specific physical cues, no conflicting cue, and
    reject crops too small or blurred to verify. Deterministic code derives the
-   window-level decision only after this second pass.
+   window-level decision only after this second pass. Score object completeness,
+   bbox tightness, and object fill inside the box; loose background boxes do not
+   count as verified localization.
 11. If strict full-frame crop verification finds fewer than two matches, run a
    bounded 3x3 overlapping-tile search on at most two frames from each of the
-   three highest-ranked windows. Map tile-local boxes back to full-frame
-   coordinates and require a separate strict crop-verification call.
+   three highest-ranked windows. Run a separate tight-box localization call on
+   the native tile, map that box back to full-frame coordinates, then require a
+   separate strict crop-verification call.
 12. Prefer a generated 20% continuous window that captures the most evidence
    from a localized occurrence. The target may be absent in surrounding window
    context when its true occurrence is shorter than 20%; this is the equivalent
    of padding the shorter side until the legal duration is reached.
-13. Rank legal windows by independently verified frame fraction (30%),
-   independent identity confidence (25%), occurrence capture (15%), box
-   stability (10%), real-probe support (10%), visibility (5%), and source-time
-   proximity (5%).
+13. Treat two independently verified frames as the acceptance gate, then rank
+   legal windows by verification coverage (10%), identity (20%), occurrence
+   capture (15%), presentation quality (20%), visible target scale (20%), box
+   stability (5%), real-probe support (5%), and source-time proximity (5%).
 14. Deterministically reject a window unless it captures at least two supported
    localized scout samples and at least two enlarged candidate crops pass strict
    cross-view identity verification. Color similarity and a positive claim
@@ -116,7 +119,10 @@ Use the new work directory shown above. Earlier frame caches used a different
 bbox coordinate system and window-verification schema and must not be mixed
 with this run.
 
-Result schema 9 deliberately invalidates old low-resolution frame evidence.
+Result schema 10 keeps schema-9 native-frame scouts but invalidates old window
+verifications. Reusing `temporal_easy6_native_tiles_v3` without `--force`
+recomputes only candidate-window localization/verification and final ranking.
+Result schema 9 deliberately invalidated old low-resolution frame evidence.
 Use the new work directory above instead of mixing schema 8 contact-sheet crops
 with native-frame evidence. Tile rescue is bounded and runs only after ordinary
 full-frame localization and strict crop verification fail.
@@ -223,3 +229,7 @@ Keep `datasets`, `qwen35-4b/model`, `$HOME/.conda/envs/sam3`,
 `qwen35-4b/temporal_easy6_native_tiles_v3`. Treat `hf_cache` and
 `qwen35-4b/hf-cache` as undecided until model symlinks and their sizes have been
 checked; deleting a cache still referenced by the model can break loading.
+
+The main comparison is rendered at 3200x1180 with minimal labels. Each frame
+shows only its frame number and `verified`/`unverified`. Both a maximum-quality
+JPEG and a lossless PNG are written under each case's `analysis_outputs`.

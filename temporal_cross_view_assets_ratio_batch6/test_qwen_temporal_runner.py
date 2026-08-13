@@ -315,6 +315,139 @@ class TemporalSelectionTests(unittest.TestCase):
         self.assertFalse(color_only["identity_check_passed"])
         self.assertFalse(conflicted["identity_check_passed"])
 
+    def test_presentation_metrics_reject_loose_box(self) -> None:
+        loose = runner.presentation_metrics(
+            {
+                "object_completeness": 1.0,
+                "bbox_tightness": 0.2,
+                "object_fill_fraction_in_bbox": 0.1,
+            },
+            [0.25, 0.25, 0.75, 0.75],
+        )
+        tight = runner.presentation_metrics(
+            {
+                "object_completeness": 0.9,
+                "bbox_tightness": 0.9,
+                "object_fill_fraction_in_bbox": 0.8,
+            },
+            [0.40, 0.40, 0.65, 0.70],
+        )
+        self.assertFalse(loose["localization_check_passed"])
+        self.assertTrue(tight["localization_check_passed"])
+        self.assertGreater(
+            tight["presentation_quality"], loose["presentation_quality"]
+        )
+
+    def test_presentation_scores_reward_large_tight_target(self) -> None:
+        scores = runner.verification_presentation_scores(
+            {
+                "frame_results": [
+                    {
+                        "target_present": True,
+                        "localization_check_passed": True,
+                        "presentation_quality": 0.9,
+                        "target_scale_score": 0.8,
+                        "estimated_target_frame_fraction": 0.08,
+                        "bbox_tightness": 0.9,
+                        "object_completeness": 0.95,
+                    }
+                ]
+            }
+        )
+        self.assertEqual(scores["mean_presentation_quality"], 0.9)
+        self.assertEqual(scores["mean_target_scale_score"], 0.8)
+
+    def test_large_clear_window_can_beat_more_verified_small_window(self) -> None:
+        evidence = []
+        for frame_id in range(40):
+            evidence.append(
+                {
+                    "cam": "cam01",
+                    "frame_id": frame_id,
+                    "model_presence": "confirmed",
+                    "target_present": True,
+                    "evidence_score": 0.9,
+                    "bbox_xyxy_normalized": [0.2, 0.2, 0.5, 0.5],
+                    "visibility": 0.9,
+                    "identity_confidence": 0.9,
+                    "inference_kind": "qwen",
+                }
+            )
+        windows = []
+        for index, start in enumerate((0, 20)):
+            windows.append(
+                {
+                    "window_id": f"cam01_window_{index:04d}",
+                    "cam": "cam01",
+                    "start_frame": start,
+                    "end_frame": start + 19,
+                    "frame_ids": list(range(start, start + 20)),
+                    "requested_video_ratio": 0.20,
+                    "actual_sampled_frame_ratio": 0.20,
+                    "actual_frame_span_ratio": 0.20,
+                    "continuity_ok": True,
+                }
+            )
+        temporal_index = {
+            "cameras": {
+                "cam01": {
+                    "video_frame_span": 39,
+                    "windows": windows,
+                }
+            }
+        }
+
+        def verification(window_index: int, count: int, scale: float) -> dict:
+            start = windows[window_index]["start_frame"]
+            frame_results = []
+            for offset in range(count):
+                frame_results.append(
+                    {
+                        "frame_id": start + offset,
+                        "presence": "confirmed",
+                        "target_present": True,
+                        "localization_check_passed": True,
+                        "bbox_xyxy_normalized": [0.2, 0.2, 0.5, 0.5],
+                        "identity_confidence": 0.9,
+                        "presentation_quality": 0.9,
+                        "target_scale_score": scale,
+                        "estimated_target_frame_fraction": 0.08 * scale,
+                        "bbox_tightness": 0.9,
+                        "object_completeness": 0.9,
+                    }
+                )
+            return {
+                "contains_target_occurrence": True,
+                "visible_summary_position_count": count,
+                "verified_frame_ids": [start + offset * 4 for offset in range(5)],
+                "representative_frame_id": start,
+                "representative_bbox_xyxy_normalized": [0.2, 0.2, 0.5, 0.5],
+                "identity_confidence": 0.9,
+                "frame_results": frame_results,
+            }
+
+        result = runner.analyze_windows(
+            {
+                "case_id": "case",
+                "target_object": "object",
+                "source_best": {
+                    "view_name": "aria01",
+                    "frame_id": 0,
+                    "source_mask": "source_best_mask.png",
+                    "source_mask_overlay": "source_best_mask_overlay.png",
+                    "mask_area_ratio": 0.1,
+                },
+            },
+            temporal_index,
+            {"object_identity": "object"},
+            evidence,
+            {
+                "cam01_window_0000": verification(0, 2, 0.95),
+                "cam01_window_0001": verification(1, 5, 0.25),
+            },
+        )
+        self.assertEqual(result["best_segment"]["window_id"], "cam01_window_0000")
+
     def test_candidate_panel_repeats_source_context_and_crop(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
