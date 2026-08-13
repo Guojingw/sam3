@@ -30,7 +30,10 @@ windows; SAM3 makes the final mask-based temporal decision.
    identity, occurrence capture, real probe support, and the weak source prior.
 8. Pass up to five identity-verified windows to SAM3. Seed each track with a
    verified Qwen bbox, propagate a binary mask across the complete candidate
-   window, and derive every displayed bbox directly from that mask.
+   window, and derive every displayed bbox directly from that mask. When SAM3
+   returns multiple object IDs, select the mask with maximum IoU to the seed
+   box rather than the first ID. If that track fails, retry up to two additional
+   independently verified Qwen anchors from the same window.
 9. Rank SAM3 tracks by captured mask evidence, full-window coverage, longest
    continuous run, target scale, area stability, bbox motion stability, and IoU
    against at least two independently verified Qwen anchors.
@@ -38,7 +41,8 @@ windows; SAM3 makes the final mask-based temporal decision.
     anchor matches and beats the runner-up by the configured margin. Otherwise
     emit `uncertain` instead of forcing a choice.
 11. Write schema-12 `temporal_analysis_result.json`, rerender the enlarged
-    source/selected/alternative comparison, and update the batch summary.
+    source/selected/alternative comparison, save representative masks for both
+    accepted and uncertain candidates, and update the batch summary.
 
 The synchronized source frame is a search origin, not a hard target frame. The
 final segment is always continuous and occupies 20%-30% of its camera timeline.

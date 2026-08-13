@@ -45,6 +45,7 @@ def track(window_id: str, evidence: float, coverage: float) -> dict:
             "verified_anchor_iou": 0.8,
             "verified_anchor_count": 2,
             "verified_anchor_match_count": 2,
+            "prompt_mask_iou": 0.8,
             "bbox_motion_stability": 0.95,
         },
         "_masks_by_frame": {0: mask, 300: mask, 600: mask},
@@ -61,6 +62,22 @@ class Sam3RerankerTests(unittest.TestCase):
         mask = np.zeros((10, 20), dtype=bool)
         mask[2:8, 5:15] = True
         self.assertEqual(reranker.mask_bbox(mask), [0.25, 0.2, 0.75, 0.8])
+
+    def test_prompt_object_selection_does_not_take_first_object_id(self) -> None:
+        wrong = np.zeros((20, 20), dtype=bool)
+        wrong[1:3, 1:3] = True
+        target = np.zeros((20, 20), dtype=bool)
+        target[8:16, 9:17] = True
+        object_id, mask, overlap = reranker.prompt_aligned_output_mask(
+            {
+                "out_obj_ids": np.array([10, 20]),
+                "out_binary_masks": np.stack([wrong, target]),
+            },
+            [0.4, 0.35, 0.9, 0.85],
+        )
+        self.assertEqual(object_id, 20)
+        self.assertTrue(np.array_equal(mask, target))
+        self.assertGreater(overlap, 0.5)
 
     def test_mask_score_prefers_continuous_captured_evidence(self) -> None:
         strong = track("strong", 2.0, 1.0)
@@ -98,6 +115,14 @@ class Sam3RerankerTests(unittest.TestCase):
             )
             self.assertEqual(updated["status"], "uncertain")
             self.assertIsNone(updated["best_segment"])
+            self.assertTrue(
+                (
+                    Path(tmp)
+                    / "analysis_outputs"
+                    / "sam3_candidate_masks"
+                    / "left"
+                ).is_dir()
+            )
 
     def test_materialize_png_as_ordered_jpeg(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

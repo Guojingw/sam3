@@ -66,9 +66,7 @@ def mask_bbox(mask: np.ndarray) -> list[float] | None:
     ]
 
 
-def output_mask_for_object(
-    outputs: Mapping[str, Any], object_id: int | None
-) -> tuple[int | None, np.ndarray | None]:
+def output_arrays(outputs: Mapping[str, Any]) -> tuple[np.ndarray, np.ndarray]:
     raw_object_ids = outputs.get("out_obj_ids", [])
     raw_masks = outputs.get("out_binary_masks", [])
     if hasattr(raw_object_ids, "detach"):
@@ -81,6 +79,13 @@ def output_mask_for_object(
         masks = masks[:, 0]
     if masks.ndim == 2:
         masks = masks[None]
+    return object_ids, masks
+
+
+def output_mask_for_object(
+    outputs: Mapping[str, Any], object_id: int | None
+) -> tuple[int | None, np.ndarray | None]:
+    object_ids, masks = output_arrays(outputs)
     if len(object_ids) == 0 or len(masks) == 0:
         return object_id, None
     if object_id is None:
@@ -89,6 +94,26 @@ def output_mask_for_object(
     if len(matches) == 0:
         return object_id, None
     return object_id, masks[int(matches[0])].astype(bool)
+
+
+def prompt_aligned_output_mask(
+    outputs: Mapping[str, Any], prompt_box: Sequence[float]
+) -> tuple[int | None, np.ndarray | None, float]:
+    """Select the prompted SAM object, never an arbitrary first object ID."""
+    object_ids, masks = output_arrays(outputs)
+    candidates = []
+    for index, object_id in enumerate(object_ids.astype(int)):
+        if index >= len(masks):
+            continue
+        mask = masks[index].astype(bool)
+        box = mask_bbox(mask)
+        if box is None:
+            continue
+        candidates.append((box_iou(box, prompt_box), int(object_id), mask))
+    if not candidates:
+        return None, None, 0.0
+    overlap, object_id, mask = max(candidates, key=lambda item: item[0])
+    return object_id, mask, float(overlap)
 
 
 def materialize_window_frames(
@@ -120,16 +145,16 @@ def longest_true_run(values: Sequence[bool]) -> int:
     return longest
 
 
-def track_candidate(
+def track_candidate_once(
     predictor: Any,
     candidate: Mapping[str, Any],
     catalog: Mapping[tuple[str, int], Path],
     track_root: Path,
+    seed_frame_id: int,
+    seed_box: Sequence[float],
 ) -> dict[str, Any]:
     window_id = str(candidate["window_id"])
     frame_ids = [int(value) for value in candidate["frame_ids"]]
-    seed_frame_id = int(candidate["seed_frame_id"])
-    seed_box = candidate["seed_bbox_xyxy_normalized"]
     seed_index = frame_ids.index(seed_frame_id)
     frame_dir = track_root / window_id / "frames"
     materialize_window_frames(candidate, catalog, frame_dir)
@@ -153,23 +178,24 @@ def track_candidate(
                 "bounding_box_labels": [1],
             }
         )
-        object_id, seed_mask = output_mask_for_object(
-            prompted["outputs"], None
+        object_id, seed_mask, prompt_mask_iou = prompt_aligned_output_mask(
+            prompted["outputs"], seed_box
         )
         if seed_mask is not None:
             masks_by_index[seed_index] = seed_mask
-        for response in predictor.handle_stream_request(
-            {
-                "type": "propagate_in_video",
-                "session_id": session_id,
-                "propagation_direction": "both",
-            }
-        ):
-            object_id, mask = output_mask_for_object(
-                response["outputs"], object_id
-            )
-            if mask is not None:
-                masks_by_index[int(response["frame_index"])] = mask
+        if object_id is not None:
+            for response in predictor.handle_stream_request(
+                {
+                    "type": "propagate_in_video",
+                    "session_id": session_id,
+                    "propagation_direction": "both",
+                }
+            ):
+                object_id, mask = output_mask_for_object(
+                    response["outputs"], object_id
+                )
+                if mask is not None:
+                    masks_by_index[int(response["frame_index"])] = mask
     finally:
         predictor.handle_request(
             {"type": "close_session", "session_id": session_id}
@@ -273,10 +299,77 @@ def track_candidate(
             "verified_anchor_iou": anchor_consistency,
             "verified_anchor_count": len(verified_boxes),
             "verified_anchor_match_count": anchor_match_count,
+            "prompt_mask_iou": prompt_mask_iou,
             "bbox_motion_stability": motion_stability,
         },
         "_masks_by_frame": masks_by_frame,
     }
+
+
+def track_candidate(
+    predictor: Any,
+    candidate: Mapping[str, Any],
+    catalog: Mapping[tuple[str, int], Path],
+    track_root: Path,
+) -> dict[str, Any]:
+    primary = {
+        "frame_id": int(candidate["seed_frame_id"]),
+        "bbox_xyxy_normalized": candidate["seed_bbox_xyxy_normalized"],
+    }
+    seeds = [primary, *candidate.get("verified_seed_frames", [])]
+    unique_seeds = []
+    seen = set()
+    for seed in seeds:
+        key = (
+            int(seed["frame_id"]),
+            tuple(float(value) for value in seed["bbox_xyxy_normalized"]),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_seeds.append(seed)
+        if len(unique_seeds) >= 3:
+            break
+
+    trials = []
+    for seed in unique_seeds:
+        trial = track_candidate_once(
+            predictor,
+            candidate,
+            catalog,
+            track_root,
+            int(seed["frame_id"]),
+            seed["bbox_xyxy_normalized"],
+        )
+        trials.append(trial)
+        metrics = trial["mask_track_metrics"]
+        if (
+            int(metrics["verified_anchor_match_count"]) >= 2
+            and float(metrics["prompt_mask_iou"]) >= 0.10
+            and int(metrics["present_frame_count"]) >= 2
+        ):
+            break
+
+    winner = max(
+        trials,
+        key=lambda item: (
+            int(item["mask_track_metrics"]["verified_anchor_match_count"]),
+            float(item["mask_track_metrics"]["verified_anchor_iou"]),
+            float(item["mask_track_metrics"]["prompt_mask_iou"]),
+            float(item["mask_track_metrics"]["longest_continuous_fraction"]),
+            float(item["mask_track_metrics"]["coverage_fraction"]),
+        ),
+    )
+    winner["seed_trials"] = [
+        {
+            "seed_frame_id": trial["seed_frame_id"],
+            "seed_bbox_xyxy_normalized": trial["seed_bbox_xyxy_normalized"],
+            "metrics": trial["mask_track_metrics"],
+            "selected_for_window": trial is winner,
+        }
+        for trial in trials
+    ]
+    return winner
 
 
 def score_tracks(tracks: list[dict[str, Any]]) -> None:
@@ -315,6 +408,37 @@ def score_tracks(tracks: list[dict[str, Any]]) -> None:
         )
 
 
+def save_candidate_diagnostic_masks(
+    case_dir: Path, candidate: dict[str, Any]
+) -> None:
+    masks = candidate.get("_masks_by_frame", {})
+    if not masks:
+        return
+    window_id = str(candidate["window_id"])
+    output_dir = (
+        case_dir / "analysis_outputs" / "sam3_candidate_masks" / window_id
+    )
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    present_ids = sorted(int(frame_id) for frame_id in masks)
+    display_ids = set(temporal.representative_ids(present_ids, 5))
+    if candidate.get("seed_frame_id") is not None:
+        display_ids.add(int(candidate["seed_frame_id"]))
+    mask_paths = {}
+    for frame_id in display_ids:
+        mask = masks.get(frame_id)
+        if mask is None:
+            continue
+        path = output_dir / f"frame_{frame_id:06d}.png"
+        Image.fromarray(mask.astype(np.uint8) * 255).save(path)
+        mask_paths[frame_id] = str(path.relative_to(case_dir))
+    for item in candidate["frame_results"]:
+        path = mask_paths.get(int(item["frame_id"]))
+        if path:
+            item["mask_path"] = path
+
+
 def save_selected_masks(
     case_dir: Path, selected: dict[str, Any]
 ) -> list[dict[str, Any]]:
@@ -349,6 +473,8 @@ def update_result(
         ),
         reverse=True,
     )
+    for track in tracks:
+        save_candidate_diagnostic_masks(case_dir, track)
     serializable = []
     for track in tracks:
         copy = dict(track)
@@ -385,6 +511,7 @@ def update_result(
     metrics = winner["mask_track_metrics"]
     accepted = bool(
         int(metrics["present_frame_count"]) >= 2
+        and float(metrics["prompt_mask_iou"]) >= 0.10
         and float(metrics["verified_anchor_iou"]) >= 0.10
         and int(metrics["verified_anchor_count"]) >= 2
         and int(metrics["verified_anchor_match_count"]) >= 2
@@ -393,6 +520,8 @@ def update_result(
     failed_gates = []
     if int(metrics["present_frame_count"]) < 2:
         failed_gates.append("fewer than two tracked mask frames")
+    if float(metrics["prompt_mask_iou"]) < 0.10:
+        failed_gates.append("SAM3 prompt mask does not overlap its Qwen seed box")
     if int(metrics["verified_anchor_count"]) < 2:
         failed_gates.append("fewer than two independent Qwen anchors")
     if int(metrics["verified_anchor_match_count"]) < 2:
