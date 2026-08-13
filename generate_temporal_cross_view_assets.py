@@ -625,6 +625,7 @@ def create_contact_sheet(
             {
                 "cell_index": index,
                 "frame_id": frame.frame_id,
+                "original_frame_path": str(frame.path.resolve()),
                 "original_image_size": [original_width, original_height],
                 "cell_xyxy": [
                     cell_x,

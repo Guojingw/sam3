@@ -333,6 +333,60 @@ class TemporalSelectionTests(unittest.TestCase):
             with Image.open(panel_path) as panel:
                 self.assertEqual(panel.size, (1760, 500))
 
+    def test_frame_catalog_prefers_original_target_frame(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            case = root / "case"
+            work = root / "work"
+            case.mkdir()
+            original = root / "cam01_000030.jpg"
+            Image.new("RGB", (960, 540), (10, 20, 30)).save(original)
+            sheet = case / "sheet.jpg"
+            Image.new("RGB", (480, 314), (40, 50, 60)).save(sheet)
+            (case / "metadata.json").write_text(
+                '{"take_dir": ""}', encoding="utf-8"
+            )
+            index = {
+                "cameras": {
+                    "cam01": {
+                        "windows": [
+                            {
+                                "cam": "cam01",
+                                "contact_sheet": "sheet.jpg",
+                                "sheet_layout": {
+                                    "cells": [
+                                        {
+                                            "frame_id": 30,
+                                            "image_xyxy": [0, 44, 480, 314],
+                                            "original_frame_path": str(original),
+                                        }
+                                    ]
+                                },
+                            }
+                        ]
+                    }
+                }
+            }
+            catalog = runner.make_frame_catalog(case, index, work)
+            self.assertEqual(catalog[("cam01", 30)], original)
+            stats = runner.frame_catalog_statistics(catalog, work)
+            self.assertEqual(
+                stats["cameras"]["cam01"]["source"], "native_target_frame"
+            )
+            self.assertEqual(
+                stats["cameras"]["cam01"]["sample_image_size"], [960, 540]
+            )
+
+    def test_tile_box_maps_back_to_full_frame(self) -> None:
+        mapped = runner.map_tile_box_to_frame(
+            [0.25, 0.5, 0.75, 1.0], [0.2, 0.1, 0.6, 0.5]
+        )
+        self.assertEqual(mapped, [0.35, 0.55, 0.55, 0.75])
+        boxes = runner.spatial_tile_boxes()
+        self.assertEqual(len(boxes), 9)
+        self.assertEqual(boxes[0][1], [0.0, 0.0, 0.5, 0.5])
+        self.assertEqual(boxes[-1][1], [0.5, 0.5, 1.0, 1.0])
+
 
 if __name__ == "__main__":
     unittest.main()

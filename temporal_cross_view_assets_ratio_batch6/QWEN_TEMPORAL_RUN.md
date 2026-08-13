@@ -9,8 +9,9 @@ Qwen3.5 with 4B parameters; it does not mean a 3.5B model.
    `source_best_mask.png`.
 2. Create an isolated source RGB anchor from the binary mask. Overlay colors
    are explicitly excluded from identity inference.
-3. Extract each unique third-person sampled frame from the generated temporal
-   contact sheets and build previous/query/next context strips.
+3. Resolve each unique third-person sample back to its native image under the
+   take directory. Use a contact-sheet crop only when the source dataset is not
+   available, and record the input source and resolution in the result JSON.
 4. Use the largest first-person mask frame as the synchronized search origin.
    Probe densely around that frame, then expand exponentially toward the video
    boundaries rather than uniformly evaluating every frame.
@@ -33,22 +34,26 @@ Qwen3.5 with 4B parameters; it does not mean a 3.5B model.
    Require two visible identity-specific physical cues, no conflicting cue, and
    reject crops too small or blurred to verify. Deterministic code derives the
    window-level decision only after this second pass.
-11. Prefer a generated 20% continuous window that captures the most evidence
+11. If strict full-frame crop verification finds fewer than two matches, run a
+   bounded 3x3 overlapping-tile search on at most two frames from each of the
+   three highest-ranked windows. Map tile-local boxes back to full-frame
+   coordinates and require a separate strict crop-verification call.
+12. Prefer a generated 20% continuous window that captures the most evidence
    from a localized occurrence. The target may be absent in surrounding window
    context when its true occurrence is shorter than 20%; this is the equivalent
    of padding the shorter side until the legal duration is reached.
-12. Rank legal windows by independently verified frame fraction (30%),
+13. Rank legal windows by independently verified frame fraction (30%),
    independent identity confidence (25%), occurrence capture (15%), box
    stability (10%), real-probe support (10%), visibility (5%), and source-time
    proximity (5%).
-13. Deterministically reject a window unless it captures at least two supported
+14. Deterministically reject a window unless it captures at least two supported
    localized scout samples and at least two enlarged candidate crops pass strict
    cross-view identity verification. Color similarity and a positive claim
    without localization are insufficient.
-14. Compare the winner with the best non-overlapping, equal-duration global
+15. Compare the winner with the best non-overlapping, equal-duration global
    challenger. Select the strongest verified continuous window or emit
    `uncertain`.
-15. Rewrite `temporal_analysis_result.json`, render the comparison image, and
+16. Rewrite `temporal_analysis_result.json`, render the comparison image, and
    update `batch_temporal_analysis_summary.json`.
 
 The synchronized source frame is a search origin, not a hard target frame. If
@@ -82,7 +87,7 @@ one-GPU job per case instead:
 
 ```bash
 EASY6="/scratch/users/ntu/$USER/temporal_cross_view_assets_ratio_easy6"
-WORK="/scratch/users/ntu/$USER/qwen35-4b/temporal_easy6_source_centered_v2"
+WORK="/scratch/users/ntu/$USER/qwen35-4b/temporal_easy6_native_tiles_v3"
 
 cd "$HOME/worldmodel/sam3/temporal_cross_view_assets_ratio_batch6"
 bash submit_qwen_temporal_parallel.sh "$EASY6" "$WORK"
@@ -111,15 +116,15 @@ Use the new work directory shown above. Earlier frame caches used a different
 bbox coordinate system and window-verification schema and must not be mixed
 with this run.
 
-When upgrading to result schema 8, reuse the same work directory without
-`--force`. Frame scouts are reused. The eight window localization calls and
-their strict candidate-crop identity checks are recomputed because the window
-verification cache schema changed.
+Result schema 9 deliberately invalidates old low-resolution frame evidence.
+Use the new work directory above instead of mixing schema 8 contact-sheet crops
+with native-frame evidence. Tile rescue is bounded and runs only after ordinary
+full-frame localization and strict crop verification fail.
 
 The frame evidence for the command above is saved under:
 
 ```text
-/scratch/users/ntu/gwang016/qwen35-4b/temporal_easy6_source_centered_v2/
+/scratch/users/ntu/gwang016/qwen35-4b/temporal_easy6_native_tiles_v3/
 ```
 
 Rerunning the PBS script resumes from cached completed frames. To discard the
@@ -178,6 +183,43 @@ Submit the same runner with isolated assets and cache paths:
 
 ```bash
 cd "$HOME/worldmodel/sam3/temporal_cross_view_assets_ratio_batch6"
-qsub -v ASSETS="$EASY6",WORK_DIR="/scratch/users/ntu/$USER/qwen35-4b/temporal_easy6_work" \
+qsub -v ASSETS="$EASY6",WORK_DIR="/scratch/users/ntu/$USER/qwen35-4b/temporal_easy6_native_tiles_v3" \
   run_qwen_temporal_batch.pbs
 ```
+
+## Safe scratch cleanup
+
+First confirm that no job is running, then inspect sizes. Do not remove the
+dataset, active model, Conda environment, repository, current assets, or the
+new schema-9 work directory.
+
+```bash
+qstat -u "$USER"
+du -sh /scratch/users/ntu/$USER/qwen35-4b/* \
+  /scratch/users/ntu/$USER/temporal_* \
+  /scratch/users/ntu/$USER/*prompt_assets* 2>/dev/null | sort -h
+```
+
+After schema 9 has completed and its rendered outputs have been checked, these
+names are historical candidates for quarantine rather than immediate deletion:
+
+```text
+qwen35-4b/sugar_frame_crops
+qwen35-4b/temporal_batch6_work
+qwen35-4b/temporal_batch6_work_fresh
+qwen35-4b/temporal_batch6_work_v2
+qwen35-4b/temporal_easy6_work
+qwen35-4b/temporal_easy6_source_centered_v2
+temporal_cross_view_assets
+temporal_cross_view_assets_ratio
+temporal_cross_view_assets_ratio_batch6
+batch_cross_view_prompt_assets
+cross_view_prompt_assets_00a6dd13
+sam3_test_same_object
+```
+
+Keep `datasets`, `qwen35-4b/model`, `$HOME/.conda/envs/sam3`,
+`$HOME/worldmodel/sam3`, `temporal_cross_view_assets_ratio_easy6`, and
+`qwen35-4b/temporal_easy6_native_tiles_v3`. Treat `hf_cache` and
+`qwen35-4b/hf-cache` as undecided until model symlinks and their sizes have been
+checked; deleting a cache still referenced by the model can break loading.

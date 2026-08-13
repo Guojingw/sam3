@@ -21,9 +21,9 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 
 CASE_GLOB = "*__*"
-EVIDENCE_SCHEMA_VERSION = 4
-WINDOW_VERIFICATION_SCHEMA_VERSION = 6
-RESULT_SCHEMA_VERSION = 8
+EVIDENCE_SCHEMA_VERSION = 5
+WINDOW_VERIFICATION_SCHEMA_VERSION = 7
+RESULT_SCHEMA_VERSION = 9
 CONFIRMED_THRESHOLD = 0.50
 POSSIBLE_THRESHOLD = 0.45
 WINDOW_SUPPORT_FRACTION = 0.60
@@ -32,6 +32,10 @@ MAX_INTERNAL_ABSENT_RUN = 4
 MAX_OCCURRENCE_GAP = 4
 MAX_WINDOWS_TO_VERIFY = 8
 MAX_REFINEMENT_SEEDS_PER_CAMERA = 6
+MAX_TILE_RESCUE_WINDOWS = 3
+MAX_TILE_RESCUE_FRAMES_PER_WINDOW = 2
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
+FRAME_ID_RE = re.compile(r"(\d+)(?!.*\d)")
 
 
 def parse_args() -> argparse.Namespace:
@@ -216,10 +220,34 @@ def all_windows(index: Mapping[str, Any]) -> Iterable[dict[str, Any]]:
 def make_frame_catalog(
     case_dir: Path, index: Mapping[str, Any], work_case: Path
 ) -> dict[tuple[str, int], Path]:
+    """Prefer native target frames; retain contact-sheet crops as fallback."""
     frame_dir = work_case / "target_frames"
     frame_dir.mkdir(parents=True, exist_ok=True)
     catalog: dict[tuple[str, int], Path] = {}
     opened: dict[Path, Image.Image] = {}
+    metadata = read_json(case_dir / "metadata.json")
+    take_dir = Path(str(metadata.get("take_dir", ""))).expanduser()
+    native_maps: dict[str, dict[int, Path]] = {}
+
+    def native_frame(cam: str, frame_id: int, cell: Mapping[str, Any]) -> Path | None:
+        indexed = cell.get("original_frame_path")
+        if indexed:
+            path = Path(str(indexed)).expanduser()
+            if path.is_file():
+                return path
+        if cam not in native_maps:
+            camera_dir = take_dir / cam
+            mapping: dict[int, Path] = {}
+            if camera_dir.is_dir():
+                for path in camera_dir.iterdir():
+                    if not path.is_file() or path.suffix.lower() not in IMAGE_SUFFIXES:
+                        continue
+                    match = FRAME_ID_RE.search(path.stem)
+                    if match:
+                        mapping.setdefault(int(match.group(1)), path)
+            native_maps[cam] = mapping
+        return native_maps[cam].get(frame_id)
+
     try:
         for window in all_windows(index):
             cam = str(window["cam"])
@@ -228,6 +256,10 @@ def make_frame_catalog(
                 frame_id = int(cell["frame_id"])
                 key = (cam, frame_id)
                 if key in catalog:
+                    continue
+                original = native_frame(cam, frame_id, cell)
+                if original is not None:
+                    catalog[key] = original
                     continue
                 output = frame_dir / f"{cam}_{frame_id:06d}.jpg"
                 if not output.exists():
@@ -242,6 +274,29 @@ def make_frame_catalog(
     return catalog
 
 
+def frame_catalog_statistics(
+    catalog: Mapping[tuple[str, int], Path], work_case: Path
+) -> dict[str, Any]:
+    by_camera: dict[str, dict[str, Any]] = {}
+    fallback_root = (work_case / "target_frames").resolve()
+    for cam in sorted({camera for camera, _ in catalog}):
+        paths = [path for (camera, _), path in catalog.items() if camera == cam]
+        sample = paths[0]
+        with Image.open(sample) as image:
+            size = list(image.size)
+        source = (
+            "contact_sheet_crop"
+            if sample.resolve().parent == fallback_root
+            else "native_target_frame"
+        )
+        by_camera[cam] = {
+            "source": source,
+            "sample_image_size": size,
+            "frame_count": len(paths),
+        }
+    return {"cameras": by_camera}
+
+
 def make_context_strip(
     catalog: Mapping[tuple[str, int], Path],
     cam: str,
@@ -249,7 +304,7 @@ def make_context_strip(
     work_case: Path,
 ) -> Path:
     """Show previous/current/next frames while keeping the queried frame clear."""
-    output_dir = work_case / "target_context"
+    output_dir = work_case / "target_context_v2"
     output_dir.mkdir(parents=True, exist_ok=True)
     output = output_dir / f"{cam}_{frame_id:06d}_context.jpg"
     if output.exists():
@@ -367,11 +422,12 @@ def make_candidate_identity_panel(
     work_case: Path,
     window_id: str,
     frame_id: int,
+    variant: str = "full",
 ) -> Path:
     """Enlarge a proposed target without hiding its surrounding context."""
-    output_dir = work_case / "candidate_identity_panels_v2"
+    output_dir = work_case / "candidate_identity_panels_v3"
     output_dir.mkdir(parents=True, exist_ok=True)
-    output = output_dir / f"{window_id}_{frame_id:06d}.jpg"
+    output = output_dir / f"{window_id}_{frame_id:06d}_{variant}.jpg"
     if output.exists():
         return output
 
@@ -433,6 +489,213 @@ def make_candidate_identity_panel(
     draw.line((1180, 0, 1180, 500), fill=(90, 94, 96), width=3)
     panel.save(output, quality=97)
     return output
+
+
+def spatial_tile_boxes() -> list[tuple[str, list[float]]]:
+    """Return overlapping half-frame tiles that cover borders and center."""
+    starts = (0.0, 0.25, 0.5)
+    return [
+        (f"r{row}c{column}", [left, top, left + 0.5, top + 0.5])
+        for row, top in enumerate(starts)
+        for column, left in enumerate(starts)
+    ]
+
+
+def map_tile_box_to_frame(
+    tile_box: Sequence[float], local_box: Any
+) -> list[float] | None:
+    local = normalized_box(local_box)
+    if local is None:
+        return None
+    left, top, right, bottom = tile_box
+    width = right - left
+    height = bottom - top
+    return normalized_box(
+        [
+            left + local[0] * width,
+            top + local[1] * height,
+            left + local[2] * width,
+            top + local[3] * height,
+        ]
+    )
+
+
+def make_spatial_tile_panels(
+    frame_path: Path,
+    source_anchor_path: Path,
+    work_case: Path,
+    window_id: str,
+    frame_id: int,
+) -> tuple[list[Path], dict[str, list[float]]]:
+    output_dir = work_case / "spatial_tile_panels_v1" / window_id
+    output_dir.mkdir(parents=True, exist_ok=True)
+    frame = Image.open(frame_path).convert("RGB")
+    source = Image.open(source_anchor_path).convert("RGB")
+    tile_map: dict[str, list[float]] = {}
+    paths: list[Path] = []
+    for tile_id, box in spatial_tile_boxes():
+        tile_map[tile_id] = box
+        output = output_dir / f"frame_{frame_id:06d}_{tile_id}.jpg"
+        paths.append(output)
+        if output.exists():
+            continue
+        width, height = frame.size
+        pixel_box = (
+            round(box[0] * width),
+            round(box[1] * height),
+            round(box[2] * width),
+            round(box[3] * height),
+        )
+        anchor = ImageOps.contain(
+            source, (500, 430), method=Image.Resampling.LANCZOS
+        )
+        tile = ImageOps.contain(
+            frame.crop(pixel_box), (500, 430), method=Image.Resampling.LANCZOS
+        )
+        panel = Image.new("RGB", (1080, 500), (238, 238, 234))
+        panel.paste(
+            anchor,
+            ((520 - anchor.width) // 2, 60 + (430 - anchor.height) // 2),
+        )
+        panel.paste(
+            tile,
+            (560 + (500 - tile.width) // 2, 60 + (430 - tile.height) // 2),
+        )
+        draw = ImageDraw.Draw(panel)
+        draw.text(
+            (12, 16),
+            "SOURCE MASK RGB ANCHOR",
+            font=font(20),
+            fill=(20, 25, 28),
+        )
+        draw.text(
+            (572, 16),
+            f"frame {frame_id} tile {tile_id}",
+            font=font(20),
+            fill=(20, 25, 28),
+        )
+        draw.line((540, 0, 540, 500), fill=(90, 94, 96), width=3)
+        panel.save(output, quality=97)
+    return paths, tile_map
+
+
+def tile_rescue_frame(
+    qwen: "Qwen",
+    anchor: Mapping[str, Any],
+    identity: Mapping[str, Any],
+    frame_path: Path,
+    work_case: Path,
+    window_id: str,
+    frame_id: int,
+) -> tuple[dict[str, Any] | None, Any]:
+    """Search enlarged overlapping regions after full-frame localization fails."""
+    panels, tile_map = make_spatial_tile_panels(
+        frame_path,
+        anchor["isolated_path"],
+        work_case,
+        window_id,
+        frame_id,
+    )
+    image_map = [
+        {"image_number": index + 1, "tile_id": tile_id, "frame_region": box}
+        for index, (tile_id, box) in enumerate(tile_map.items())
+    ]
+    prompt = f"""
+Search one third-person frame using nine overlapping enlarged regions.
+Each image repeats the authoritative first-person masked RGB object on the
+LEFT and one third-person spatial tile on the RIGHT.
+
+Target identity:
+{json.dumps(identity, ensure_ascii=False)}
+
+Tile mapping:
+{json.dumps(image_map, ensure_ascii=False)}
+
+Return at most one best candidate. Color alone is never sufficient. A match
+must expose at least two distinct physical identity cues and no conflicting
+cue. Reject people, hands, appliances, controls, reflections, and background
+patches. If no tile is visually sufficient, return best_candidate=null.
+The bbox is normalized inside the RIGHT tile, not the full frame.
+
+Return JSON only:
+{{
+  "frame_id": {frame_id},
+  "best_candidate": {{
+    "tile_id": "r0c0",
+    "bbox_xyxy_normalized_within_tile": [0.0, 0.0, 1.0, 1.0],
+    "candidate_crop_is_visually_verifiable": false,
+    "same_object_type": false,
+    "matched_visible_cues": [],
+    "conflicting_visible_cues": [],
+    "identity_confidence": 0.0
+  }}
+}}
+"""
+    search_raw = qwen.ask(panels, prompt)
+    candidate = (
+        search_raw.get("best_candidate")
+        if isinstance(search_raw, dict)
+        else None
+    )
+    if not isinstance(candidate, dict):
+        return None, {"search": search_raw, "verification": None}
+    tile_id = str(candidate.get("tile_id", ""))
+    if tile_id not in tile_map:
+        return None, {"search": search_raw, "verification": None}
+    search_check = candidate_identity_check(candidate)
+    box = map_tile_box_to_frame(
+        tile_map[tile_id],
+        candidate.get("bbox_xyxy_normalized_within_tile"),
+    )
+    if not search_check["identity_check_passed"] or box is None:
+        return None, {"search": search_raw, "verification": None}
+
+    verification_panel = make_candidate_identity_panel(
+        frame_path,
+        anchor["isolated_path"],
+        box,
+        work_case,
+        window_id,
+        frame_id,
+        variant=f"tile_{tile_id}",
+    )
+    verification_prompt = f"""
+Independently verify this one enlarged third-person crop against the repeated
+first-person source-mask RGB anchor. The panel columns are SOURCE MASK RGB,
+third-person context, and PROPOSED OBJECT. Ignore the earlier tile decision.
+
+Authoritative source identity:
+{json.dumps(identity, ensure_ascii=False)}
+
+Color alone is insufficient. Require at least two directly visible physical
+cues and no conflicting cue. If tiny, blurred, incomplete, or a nearby object,
+set candidate_crop_is_visually_verifiable=false.
+
+Return JSON only:
+{{
+  "candidate_crop_is_visually_verifiable": false,
+  "same_object_type": false,
+  "matched_visible_cues": [],
+  "conflicting_visible_cues": [],
+  "identity_confidence": 0.0
+}}
+"""
+    verification_raw = qwen.ask([verification_panel], verification_prompt)
+    if not isinstance(verification_raw, dict):
+        return None, {"search": search_raw, "verification": verification_raw}
+    check = candidate_identity_check(verification_raw)
+    raw = {"search": search_raw, "verification": verification_raw}
+    if not check["identity_check_passed"]:
+        return None, raw
+    return {
+        "frame_id": frame_id,
+        "presence": "confirmed",
+        "target_present": True,
+        "bbox_xyxy_normalized": box,
+        "localization_method": "overlapping_tile_search",
+        "tile_id": tile_id,
+        **check,
+    }, raw
 
 
 class Qwen:
@@ -1293,6 +1556,14 @@ def verify_candidate_windows(
     selected = verification_candidates(
         temporal_index, evidence, source_frame, MAX_WINDOWS_TO_VERIFY
     )
+    tile_rescue_window_ids = {
+        str(window["window_id"])
+        for window, _ in sorted(
+            selected,
+            key=lambda entry: float(entry[1]["verification_priority"]),
+            reverse=True,
+        )[:MAX_TILE_RESCUE_WINDOWS]
+    }
 
     for position, (window, frame_score) in enumerate(selected, start=1):
         window_id = str(window["window_id"])
@@ -1390,11 +1661,12 @@ return an overall presence decision; deterministic code will calculate it.
                     "frame_id": frame_id,
                     "presence": "candidate" if accepted else "absent",
                     "preliminary_presence": presence,
-                    "preliminary_identity_confidence": (
-                        confidence if accepted else 0.0
-                    ),
+                    "preliminary_identity_confidence": confidence,
                     "target_present": False,
                     "bbox_xyxy_normalized": box if accepted else None,
+                    "localization_method": (
+                        "full_frame_bbox" if accepted else None
+                    ),
                     "identity_confidence": 0.0,
                     "identity_check_passed": False,
                     "matched_visible_cues": [],
@@ -1480,6 +1752,58 @@ Return JSON only with exactly one entry per mapped frame:
                 "confirmed" if item["target_present"] else "rejected_candidate"
             )
         positives = [item for item in frame_results if item["target_present"]]
+        tile_rescue_raw: list[dict[str, Any]] = []
+        if len(positives) < 2 and window_id in tile_rescue_window_ids:
+            positions = {
+                frame_id: index for index, frame_id in enumerate(target_frame_ids)
+            }
+            rescue_pool = sorted(
+                (item for item in frame_results if not item["target_present"]),
+                key=lambda item: (
+                    item.get("preliminary_presence") == "confirmed",
+                    float(item.get("preliminary_identity_confidence", 0.0)),
+                    float(
+                        evidence_map[(window["cam"], int(item["frame_id"]))].get(
+                            "evidence_score", 0.0
+                        )
+                    ),
+                ),
+                reverse=True,
+            )
+            rescue_targets: list[dict[str, Any]] = []
+            for item in rescue_pool:
+                item_position = positions[int(item["frame_id"])]
+                if any(
+                    abs(item_position - positions[int(other["frame_id"])]) <= 1
+                    for other in rescue_targets
+                ):
+                    continue
+                rescue_targets.append(item)
+                if len(rescue_targets) >= MAX_TILE_RESCUE_FRAMES_PER_WINDOW:
+                    break
+            for item in rescue_targets:
+                frame_id = int(item["frame_id"])
+                print(
+                    f"[tile rescue] {window_id} frame {frame_id}",
+                    flush=True,
+                )
+                rescued, rescue_raw = tile_rescue_frame(
+                    qwen,
+                    anchor,
+                    identity,
+                    catalog[(window["cam"], frame_id)],
+                    work_case,
+                    window_id,
+                    frame_id,
+                )
+                tile_rescue_raw.append(
+                    {"frame_id": frame_id, "response": rescue_raw}
+                )
+                if rescued is not None:
+                    item.update(rescued)
+            positives = [
+                item for item in frame_results if item["target_present"]
+            ]
         representative = max(
             positives,
             key=lambda item: float(item["identity_confidence"]),
@@ -1527,6 +1851,7 @@ Return JSON only with exactly one entry per mapped frame:
             ),
             "raw_full_frame_response": raw,
             "raw_candidate_crop_response": crop_raw,
+            "raw_tile_rescue_responses": tile_rescue_raw,
         }
         write_json(cache_path, cached)
     return cached
@@ -2370,6 +2695,12 @@ def process_case(
     anchor = build_source_anchor(case_dir, work_case)
     temporal_index = read_json(case_dir / "temporal_window_index.json")
     catalog = make_frame_catalog(case_dir, temporal_index, work_case)
+    catalog_statistics = frame_catalog_statistics(catalog, work_case)
+    print(
+        "Target frame inputs: "
+        + json.dumps(catalog_statistics["cameras"], ensure_ascii=False),
+        flush=True,
+    )
     evidence_path = work_case / "qwen_frame_evidence.json"
     identity_path = work_case / "qwen_source_identity.json"
     result_path = case_dir / "temporal_analysis_result.json"
@@ -2389,9 +2720,14 @@ def process_case(
 
         evidence = []
         evidence_cache_invalidated = False
+        input_signature = ",".join(
+            f"{cam}:{details['source']}:{details['sample_image_size'][0]}x"
+            f"{details['sample_image_size'][1]}"
+            for cam, details in catalog_statistics["cameras"].items()
+        )
         probe_config = (
-            f"source_centered_v1:max={max_frame_probes_per_camera}:"
-            f"radius={probe_refinement_radius}"
+            f"source_centered_v2:max={max_frame_probes_per_camera}:"
+            f"radius={probe_refinement_radius}:input={input_signature}"
         )
         if evidence_path.exists() and not force:
             evidence = read_json(evidence_path)
@@ -2492,6 +2828,7 @@ def process_case(
             "per_camera_qwen_frame_probe_count": per_camera_probe_count,
             "window_verification_count": len(window_verifications),
         }
+        result["input_frame_statistics"] = catalog_statistics
         write_json(result_path, result)
 
     render_result(
