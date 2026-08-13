@@ -23,7 +23,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 CASE_GLOB = "*__*"
 EVIDENCE_SCHEMA_VERSION = 5
 WINDOW_VERIFICATION_SCHEMA_VERSION = 8
-RESULT_SCHEMA_VERSION = 10
+RESULT_SCHEMA_VERSION = 11
 CONFIRMED_THRESHOLD = 0.50
 POSSIBLE_THRESHOLD = 0.45
 WINDOW_SUPPORT_FRACTION = 0.60
@@ -259,6 +259,72 @@ def build_source_anchor(case_dir: Path, work_case: Path) -> dict[str, Any]:
 def all_windows(index: Mapping[str, Any]) -> Iterable[dict[str, Any]]:
     for camera in index["cameras"].values():
         yield from camera["windows"]
+
+
+def representative_ids(frame_ids: Sequence[int], count: int) -> list[int]:
+    if not frame_ids:
+        return []
+    count = min(count, len(frame_ids))
+    if count == 1:
+        return [int(frame_ids[len(frame_ids) // 2])]
+    indexes = sorted(
+        {
+            round(position * (len(frame_ids) - 1) / (count - 1))
+            for position in range(count)
+        }
+    )
+    return [int(frame_ids[index]) for index in indexes]
+
+
+def dense_sliding_windows(
+    index: Mapping[str, Any], ratios: Sequence[float] = (0.20, 0.25, 0.30)
+) -> list[dict[str, Any]]:
+    """Enumerate every legal sampled-frame start, independent of sheet stride."""
+    output: list[dict[str, Any]] = []
+    for cam, camera in index["cameras"].items():
+        frame_ids = sorted(
+            {
+                int(frame_id)
+                for window in camera["windows"]
+                for frame_id in window["frame_ids"]
+            }
+        )
+        if len(frame_ids) < 2:
+            continue
+        video_span = max(1, frame_ids[-1] - frame_ids[0])
+        threshold = camera.get("continuity_split_threshold")
+        seen_lengths: set[int] = set()
+        for ratio in ratios:
+            length = max(2, round(len(frame_ids) * float(ratio)))
+            if length in seen_lengths or length > len(frame_ids):
+                continue
+            seen_lengths.add(length)
+            for start_index in range(0, len(frame_ids) - length + 1):
+                ids = frame_ids[start_index : start_index + length]
+                gaps = [right - left for left, right in zip(ids, ids[1:])]
+                output.append(
+                    {
+                        "window_id": (
+                            f"{cam}_dense_r{round(ratio * 100):02d}_"
+                            f"s{start_index:05d}"
+                        ),
+                        "cam": cam,
+                        "start_index": start_index,
+                        "start_frame": ids[0],
+                        "end_frame": ids[-1],
+                        "frame_ids": ids,
+                        "representative_frame_ids": representative_ids(ids, 5),
+                        "requested_video_ratio": float(ratio),
+                        "actual_sampled_frame_ratio": length / len(frame_ids),
+                        "actual_frame_span_ratio": (ids[-1] - ids[0]) / video_span,
+                        "continuity_ok": bool(
+                            not gaps
+                            or threshold is None
+                            or max(gaps) <= float(threshold)
+                        ),
+                    }
+                )
+    return output
 
 
 def make_frame_catalog(
@@ -1452,6 +1518,139 @@ def source_frame_proximity(
     return max(0.0, 1.0 - abs(midpoint - source_frame) / video_span)
 
 
+def discrete_frame_score(item: Mapping[str, Any]) -> dict[str, float]:
+    presence = str(item.get("model_presence", "absent")).lower()
+    identity = {"confirmed": 1.0, "possible": 0.4}.get(presence, 0.0)
+    if not item.get("bbox_xyxy_normalized"):
+        identity = 0.0
+    visibility_value = float(item.get("visibility", 0.0))
+    visibility = (
+        1.0
+        if visibility_value >= 0.75
+        else 0.6
+        if visibility_value >= 0.40
+        else 0.2
+        if identity > 0.0
+        else 0.0
+    )
+    return {"identity": identity, "visibility": visibility}
+
+
+def dense_window_fast_score(
+    window: Mapping[str, Any],
+    evidence_map: Mapping[tuple[str, int], Mapping[str, Any]],
+    temporal_index: Mapping[str, Any],
+    source_frame: int,
+) -> dict[str, float]:
+    frame_scores = [
+        discrete_frame_score(evidence_map[(window["cam"], int(frame_id))])
+        for frame_id in window["frame_ids"]
+    ]
+    identities = [item["identity"] for item in frame_scores]
+    visibilities = [item["visibility"] for item in frame_scores]
+    positives = [index for index, value in enumerate(identities) if value > 0.0]
+    longest_run = 0
+    current = 0
+    for value in identities:
+        if value > 0.0:
+            current += 1
+            longest_run = max(longest_run, current)
+        else:
+            current = 0
+    capture = sum(identities) / max(1, len(identities))
+    clear_fraction = sum(value >= 1.0 for value in visibilities) / max(
+        1, len(visibilities)
+    )
+    continuity = longest_run / max(1, len(identities))
+    low_occlusion = statistics.mean(visibilities) if visibilities else 0.0
+    prior = source_frame_proximity(window, temporal_index, source_frame)
+    return {
+        "identity_capture": capture,
+        "clear_visibility_fraction": clear_fraction,
+        "continuity": continuity,
+        "low_occlusion": low_occlusion,
+        "source_frame_temporal_prior": prior,
+        "localized_sample_count": float(len(positives)),
+        "fast_score": (
+            0.45 * capture
+            + 0.20 * clear_fraction
+            + 0.20 * continuity
+            + 0.10 * low_occlusion
+            + 0.05 * prior
+        ),
+    }
+
+
+def temporal_iou(left: Mapping[str, Any], right: Mapping[str, Any]) -> float:
+    if left["cam"] != right["cam"]:
+        return 0.0
+    intersection = max(
+        0,
+        min(int(left["end_frame"]), int(right["end_frame"]))
+        - max(int(left["start_frame"]), int(right["start_frame"])),
+    )
+    union = max(
+        1,
+        max(int(left["end_frame"]), int(right["end_frame"]))
+        - min(int(left["start_frame"]), int(right["start_frame"])),
+    )
+    return intersection / union
+
+
+def select_dense_verification_candidates(
+    temporal_index: Mapping[str, Any],
+    evidence: list[dict[str, Any]],
+    source_frame: int,
+    limit: int = MAX_WINDOWS_TO_VERIFY,
+    nms_iou: float = 0.65,
+) -> list[tuple[dict[str, Any], dict[str, float]]]:
+    evidence_map = {
+        (str(item["cam"]), int(item["frame_id"])): item for item in evidence
+    }
+    ranked = [
+        (
+            window,
+            dense_window_fast_score(
+                window, evidence_map, temporal_index, source_frame
+            ),
+        )
+        for window in dense_sliding_windows(temporal_index)
+    ]
+    ranked.sort(
+        key=lambda entry: (
+            entry[1]["fast_score"],
+            entry[1]["localized_sample_count"],
+            -abs(float(entry[0]["requested_video_ratio"]) - 0.20),
+        ),
+        reverse=True,
+    )
+    selected: list[tuple[dict[str, Any], dict[str, float]]] = []
+
+    # Preserve one source-aligned 20% candidate per camera before temporal NMS.
+    for cam in sorted(temporal_index["cameras"]):
+        aligned = [
+            entry
+            for entry in ranked
+            if entry[0]["cam"] == cam
+            and abs(float(entry[0]["requested_video_ratio"]) - 0.20) < 1e-6
+            and int(entry[0]["start_frame"])
+            <= source_frame
+            <= int(entry[0]["end_frame"])
+        ]
+        if aligned:
+            selected.append(max(aligned, key=lambda entry: entry[1]["fast_score"]))
+
+    for entry in ranked:
+        if any(entry[0]["window_id"] == item[0]["window_id"] for item in selected):
+            continue
+        if any(temporal_iou(entry[0], item[0]) > nms_iou for item in selected):
+            continue
+        selected.append(entry)
+        if len(selected) >= limit:
+            break
+    return selected[:limit]
+
+
 def occurrence_capture(
     window: Mapping[str, Any],
     runs: list[dict[str, Any]],
@@ -1521,69 +1720,20 @@ def verification_candidates(
     source_frame: int,
     limit: int = MAX_WINDOWS_TO_VERIFY,
 ) -> list[tuple[Mapping[str, Any], dict[str, Any]]]:
-    """Compare equal 20% windows across time, not only source-near windows."""
-    evidence_map = {
-        (item["cam"], int(item["frame_id"])): item for item in evidence
-    }
-    windows = list(all_windows(temporal_index))
-    preferred = [
-        window
-        for window in windows
-        if abs(float(window["requested_video_ratio"]) - 0.20) < 1e-6
+    """Dense every-start sliding windows followed by bounded temporal NMS."""
+    selected = select_dense_verification_candidates(
+        temporal_index, evidence, source_frame, limit
+    )
+    return [
+        (
+            window,
+            {
+                **score,
+                "verification_priority": score["fast_score"],
+            },
+        )
+        for window, score in selected
     ]
-    if preferred:
-        windows = preferred
-    ranked: list[tuple[Mapping[str, Any], dict[str, Any]]] = []
-    for window in windows:
-        items = [
-            evidence_map[(window["cam"], int(frame_id))]
-            for frame_id in window["frame_ids"]
-        ]
-        score = score_window(window, items)
-        score["source_frame_temporal_prior"] = source_frame_proximity(
-            window, temporal_index, source_frame
-        )
-        score["verification_priority"] = (
-            0.70 * score["overall"]
-            + 0.20 * score["real_probe_support_fraction"]
-            + 0.10 * score["source_frame_temporal_prior"]
-        )
-        ranked.append((window, score))
-
-    # Reserve equal temporal bins per camera so a stronger segment far from the
-    # synchronized source frame can still beat the source-centered candidate.
-    cameras = sorted({str(window["cam"]) for window, _ in ranked})
-    slots_per_camera = max(1, limit // max(1, len(cameras)))
-    selected: list[tuple[Mapping[str, Any], dict[str, Any]]] = []
-    selected_ids: set[str] = set()
-    for cam in cameras:
-        camera_entries = sorted(
-            (entry for entry in ranked if str(entry[0]["cam"]) == cam),
-            key=lambda entry: int(entry[0]["start_frame"]),
-        )
-        for slot in range(min(slots_per_camera, len(camera_entries))):
-            start = math.floor(slot * len(camera_entries) / slots_per_camera)
-            end = math.floor((slot + 1) * len(camera_entries) / slots_per_camera)
-            bucket = camera_entries[start : max(start + 1, end)]
-            choice = max(
-                bucket, key=lambda entry: entry[1]["verification_priority"]
-            )
-            window_id = str(choice[0]["window_id"])
-            if window_id not in selected_ids:
-                selected.append(choice)
-                selected_ids.add(window_id)
-
-    for entry in sorted(
-        ranked, key=lambda value: value[1]["verification_priority"], reverse=True
-    ):
-        window_id = str(entry[0]["window_id"])
-        if window_id in selected_ids:
-            continue
-        selected.append(entry)
-        selected_ids.add(window_id)
-        if len(selected) >= limit:
-            break
-    return selected[:limit]
 
 
 def window_verification_frame_ids(
@@ -2017,7 +2167,7 @@ def analyze_windows(
     runs = occurrence_runs(evidence)
     source_frame = int(metadata["source_best"]["frame_id"])
     candidates = []
-    for window in all_windows(temporal_index):
+    for window in dense_sliding_windows(temporal_index):
         items = [
             evidence_map[(window["cam"], int(frame_id))]
             for frame_id in window["frame_ids"]
@@ -2064,6 +2214,15 @@ def analyze_windows(
             + 0.05 * score["real_probe_support_fraction"]
             + 0.05 * score["source_frame_temporal_prior"]
         )
+        # Qwen presentation estimates are useful diagnostics, but they must not
+        # decide which windows reach the mask-tracking stage.
+        score["sam3_shortlist_score"] = (
+            0.25 * verification_frame_fraction
+            + 0.25 * verification_identity
+            + 0.25 * score["captured_occurrence_fraction"]
+            + 0.15 * score["real_probe_support_fraction"]
+            + 0.10 * score["source_frame_temporal_prior"]
+        )
         score["valid"] = bool(
             window.get("continuity_ok")
             and 0.20 <= float(window["requested_video_ratio"]) <= 0.30
@@ -2076,11 +2235,11 @@ def analyze_windows(
 
     candidates.sort(
         key=lambda entry: (
-            -abs(float(entry[0]["requested_video_ratio"]) - 0.20),
-            entry[2]["selection_score"],
+            entry[2]["sam3_shortlist_score"],
             entry[2]["captured_real_supported_count"],
             entry[2]["captured_supported_count"],
             entry[2]["source_frame_temporal_prior"],
+            -float(entry[0]["requested_video_ratio"]),
         ),
         reverse=True,
     )
@@ -2179,7 +2338,6 @@ def analyze_windows(
         "selection_constraints": {
             "window_ratio_min": 0.20,
             "window_ratio_max": 0.30,
-            "preferred_window_ratio": 0.20,
             "minimum_captured_supported_frames": 2,
             "minimum_captured_confirmed_frames": 1,
             "minimum_crop_verified_identity_frames": 2,
@@ -2190,19 +2348,19 @@ def analyze_windows(
             "occurrence_qwen_verification_required": True,
         },
         "selection_algorithm": {
-            "name": "source_centered_bidirectional_search_with_global_challenger",
+            "name": "dense_sliding_windows_then_sam3_mask_rerank",
             "source_frame_is_weak_prior": True,
-            "preferred_ratio": 0.20,
-            "candidate_comparison": "equal-duration temporal bins per camera",
+            "window_ratios": [0.20, 0.25, 0.30],
+            "candidate_comparison": (
+                "every sampled-frame start, CPU scoring, temporal NMS, strict "
+                "Qwen identity verification, then SAM3 mask reranking"
+            ),
             "ranking_weights": {
-                "independently_verified_frame_fraction": 0.10,
-                "window_identity_verification": 0.20,
-                "captured_occurrence_fraction": 0.15,
-                "mean_presentation_quality": 0.20,
-                "mean_target_scale_score": 0.20,
-                "bbox_temporal_stability": 0.05,
-                "real_probe_support_fraction": 0.05,
-                "source_frame_temporal_prior": 0.05,
+                "independently_verified_frame_fraction": 0.25,
+                "window_identity_verification": 0.25,
+                "captured_occurrence_fraction": 0.25,
+                "real_probe_support_fraction": 0.15,
+                "source_frame_temporal_prior": 0.10,
             },
         },
         "window_verifications": window_verifications,
@@ -2214,10 +2372,70 @@ def analyze_windows(
         "uncertainty": "",
         "confidence": 0.0,
         "global_challenger_comparison": None,
+        "sam3_rerank_candidates": [],
+        "pipeline_status": "awaiting_sam3_rerank",
     }
+    sam3_shortlist = sorted(
+        valid,
+        key=lambda entry: (
+            entry[2]["sam3_shortlist_score"],
+            entry[2]["captured_real_supported_count"],
+        ),
+        reverse=True,
+    )
+    for window_candidate, _, score_candidate in sam3_shortlist[:5]:
+        verification_candidate = score_candidate.get("window_verification") or {}
+        verified_frames = [
+            item
+            for item in verification_candidate.get("frame_results", [])
+            if item.get("target_present") and item.get("bbox_xyxy_normalized")
+        ]
+        seed = max(
+            verified_frames,
+            key=lambda item: (
+                float(item.get("identity_confidence", 0.0)),
+                float(item.get("bbox_tightness", 0.0)),
+            ),
+            default=None,
+        )
+        result["sam3_rerank_candidates"].append(
+            {
+                "window_id": window_candidate["window_id"],
+                "cam": window_candidate["cam"],
+                "start_frame": window_candidate["start_frame"],
+                "end_frame": window_candidate["end_frame"],
+                "requested_video_ratio": window_candidate[
+                    "requested_video_ratio"
+                ],
+                "actual_sampled_frame_ratio": window_candidate[
+                    "actual_sampled_frame_ratio"
+                ],
+                "actual_frame_span_ratio": window_candidate[
+                    "actual_frame_span_ratio"
+                ],
+                "frame_ids": window_candidate["frame_ids"],
+                "qwen_fast_score": round(
+                    float(score_candidate.get("sam3_shortlist_score", 0.0)), 6
+                ),
+                "seed_frame_id": seed["frame_id"] if seed else None,
+                "seed_bbox_xyxy_normalized": (
+                    seed["bbox_xyxy_normalized"] if seed else None
+                ),
+                "verified_seed_frames": [
+                    {
+                        "frame_id": item["frame_id"],
+                        "bbox_xyxy_normalized": item[
+                            "bbox_xyxy_normalized"
+                        ],
+                    }
+                    for item in verified_frames
+                ],
+            }
+        )
     if not selected:
+        result["pipeline_status"] = "complete_no_sam3_candidates"
         result["uncertainty"] = (
-            "No generated 20%-30% continuous window contains at least two "
+            "No dense 20%-30% continuous window contains at least two "
             "localized scouts and two independently crop-verified identity matches."
         )
         result["confidence"] = round(
@@ -2341,8 +2559,8 @@ def analyze_windows(
         },
         "confidence": round(score["overall"], 4),
         "reason_selected": (
-            "The continuous 20% window has the strongest localized occurrence "
-            "score and beats the same-duration global challenger."
+            "Provisional Qwen shortlist leader among dense continuous 20%-30% "
+            "windows; SAM3 mask reranking is still required."
         ),
         "recommended_sam_prompt": (
             f"Segment the {identity.get('object_identity', metadata['target_object'])} "
@@ -2398,6 +2616,15 @@ def draw_frame_panel(
     image_y = (size[1] - fitted.height) // 2
     panel = Image.new("RGB", size, (240, 240, 236))
     panel.paste(fitted, (image_x, image_y))
+    if evidence and evidence.get("mask_path"):
+        mask_path = Path(str(evidence["mask_path"]))
+        if mask_path.is_file():
+            mask = Image.open(mask_path).convert("L").resize(
+                (fitted.width, fitted.height), Image.Resampling.NEAREST
+            )
+            color = Image.new("RGB", fitted.size, (0, 230, 170))
+            alpha = mask.point(lambda value: round(value * 0.35))
+            panel.paste(color, (image_x, image_y), alpha)
     draw = ImageDraw.Draw(panel)
     if evidence and evidence.get("bbox_xyxy_normalized"):
         x1, y1, x2, y2 = evidence["bbox_xyxy_normalized"]
@@ -2411,7 +2638,11 @@ def draw_frame_panel(
     frame_id = evidence.get("frame_id") if evidence else "?"
     inference_kind = evidence.get("inference_kind", "qwen") if evidence else "none"
     classification = (
-        "verified" if inference_kind == "crop-verified" else "unverified"
+        "mask-tracked"
+        if inference_kind == "sam3-mask"
+        else "verified"
+        if inference_kind == "crop-verified"
+        else "unverified"
     )
     draw.rectangle((0, 0, 245, 38), fill=(15, 21, 25))
     draw.text(
@@ -2430,6 +2661,7 @@ def render_selected_contact_sheet(
     evidence_map: Mapping[tuple[str, int], Mapping[str, Any]],
     temporal_index: Mapping[str, Any],
     work_case: Path,
+    catalog: Mapping[tuple[str, int], Path],
 ) -> Path:
     output = output_dir / "selected_best_segment_contact_sheet.jpg"
     best = result.get("best_segment")
@@ -2472,11 +2704,30 @@ def render_selected_contact_sheet(
         canvas.save(output, quality=96)
         return output
 
-    window = next(
-        item
-        for item in all_windows(temporal_index)
-        if item["window_id"] == best["window_id"]
-    )
+    windows = {
+        str(item["window_id"]): item
+        for item in [*all_windows(temporal_index), *dense_sliding_windows(temporal_index)]
+    }
+    window = windows[str(best["window_id"])]
+    if "contact_sheet" not in window:
+        items = window_display_items(window, evidence_map)
+        canvas = Image.new("RGB", (2500, 380), (246, 243, 234))
+        draw = ImageDraw.Draw(canvas)
+        draw.text(
+            (15, 12),
+            f"SELECTED {best['window_id']} | {best['start_frame']}-{best['end_frame']}",
+            font=font(22),
+            fill=(20, 27, 31),
+        )
+        for index, item in enumerate(items[:5]):
+            panel = draw_frame_panel(
+                catalog[(str(item["cam"]), int(item["frame_id"]))],
+                item,
+                (480, 300),
+            )
+            canvas.paste(panel, (15 + index * 495, 60))
+        canvas.save(output, quality=100, subsampling=0)
+        return output
     sheet = Image.open(case_dir / window["contact_sheet"]).convert("RGB")
     banner_height = 105
     canvas = Image.new(
@@ -2638,6 +2889,44 @@ def render_result(
     evidence_map = verified_render_evidence(
         evidence, result.get("window_verifications", {})
     )
+    sam3_candidate_frames = [
+        (candidate.get("cam"), item)
+        for candidate in reversed(
+            (result.get("sam3_rerank") or {}).get("candidates", [])
+        )
+        for item in candidate.get("frame_results", [])
+    ]
+    selected_cam = str(best.get("cam")) if best else None
+    selected_sam3 = {
+        (selected_cam, int(item["frame_id"])): item
+        for item in result.get("sam3_frame_evidence", [])
+        if selected_cam
+    }
+    for cam, item in sam3_candidate_frames:
+        if not cam or not item.get("target_present"):
+            continue
+        frame_id = int(item["frame_id"])
+        key = (str(cam), frame_id)
+        selected_item = selected_sam3.get(key, item)
+        if key not in evidence_map:
+            continue
+        evidence_map[key].update(
+            {
+                "model_presence": "confirmed",
+                "target_present": True,
+                "bbox_xyxy_normalized": selected_item.get(
+                    "mask_bbox_xyxy_normalized"
+                ),
+                "visibility": 1.0,
+                "identity_confidence": 1.0,
+                "evidence_score": 1.0,
+                "inference_kind": "sam3-mask",
+                "mask_path": selected_item.get("mask_path"),
+            }
+        )
+    for item in evidence_map.values():
+        if item.get("mask_path"):
+            item["mask_path"] = str(case_dir / str(item["mask_path"]))
     selected_sheet = render_selected_contact_sheet(
         case_dir,
         output_dir,
@@ -2645,9 +2934,14 @@ def render_result(
         evidence_map,
         temporal_index,
         work_case,
+        catalog,
     )
     windows_by_id = {
-        str(window["window_id"]): window for window in all_windows(temporal_index)
+        str(window["window_id"]): window
+        for window in [
+            *all_windows(temporal_index),
+            *dense_sliding_windows(temporal_index),
+        ]
     }
     selected_items: list[Mapping[str, Any]] = []
     selected_window: Mapping[str, Any] | None = None
@@ -2926,6 +3220,7 @@ def process_case(
         "case_id": case_dir.name,
         "target_object": result["target_object"],
         "status": result["status"],
+        "pipeline_status": result.get("pipeline_status", "legacy"),
         "source_mask": result["source_best_mask"],
         "source_object": result["source_identity"].get("object_identity"),
         "window_id": best["window_id"] if best else None,
@@ -2977,7 +3272,8 @@ def main() -> None:
                 "best_segment": None,
                 "error": str(error),
             }
-            write_json(case_dir / "temporal_analysis_result.json", failure)
+            if not args.render_only:
+                write_json(case_dir / "temporal_analysis_result.json", failure)
             summaries.append(failure)
     summary_path = (
         args.summary_path.resolve()

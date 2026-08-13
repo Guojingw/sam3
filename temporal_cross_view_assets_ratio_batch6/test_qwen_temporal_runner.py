@@ -53,7 +53,7 @@ class TemporalSelectionTests(unittest.TestCase):
             (item["cam"], item["frame_id"]): item for item in evidence
         }
         output = {}
-        for window in runner.all_windows(self.index):
+        for window in runner.dense_sliding_windows(self.index):
             items = [
                 evidence_map[(window["cam"], frame_id)]
                 for frame_id in window["frame_ids"]
@@ -97,7 +97,7 @@ class TemporalSelectionTests(unittest.TestCase):
                 }
         return output
 
-    def test_selects_only_inside_long_occurrence(self) -> None:
+    def test_long_occurrence_is_fully_captured_with_legal_padding(self) -> None:
         evidence = synthetic_evidence(1200, 2400)
         result = runner.analyze_windows(
             self.metadata,
@@ -108,8 +108,11 @@ class TemporalSelectionTests(unittest.TestCase):
         )
         self.assertEqual(result["status"], "success")
         best = result["best_segment"]
-        self.assertGreaterEqual(best["start_frame"], 1200)
-        self.assertLessEqual(best["end_frame"], 2400)
+        self.assertLessEqual(best["start_frame"], 1200)
+        self.assertGreaterEqual(best["end_frame"], 2400)
+        self.assertEqual(
+            best["captured_occurrence"]["captured_occurrence_fraction"], 1.0
+        )
 
     def test_short_occurrence_selects_nearest_twenty_percent_window(self) -> None:
         evidence = synthetic_evidence(1200, 1800)
@@ -216,7 +219,7 @@ class TemporalSelectionTests(unittest.TestCase):
         )
         self.assertLessEqual(len(keys), 15)
 
-    def test_verification_candidates_cover_the_full_timeline(self) -> None:
+    def test_verification_candidates_are_dense_scored_and_bounded(self) -> None:
         evidence = synthetic_evidence(2100, 2400)
         selected = runner.verification_candidates(
             self.index,
@@ -226,10 +229,29 @@ class TemporalSelectionTests(unittest.TestCase):
         )
         starts = sorted(int(window["start_frame"]) for window, _ in selected)
         self.assertTrue(
-            all(float(window["requested_video_ratio"]) == 0.20 for window, _ in selected)
+            all(
+                0.20 <= float(window["requested_video_ratio"]) <= 0.30
+                for window, _ in selected
+            )
         )
-        self.assertLess(starts[0], 1000)
-        self.assertGreater(starts[-1], 3000)
+        self.assertLessEqual(len(selected), 8)
+        self.assertTrue(any(start <= 2100 <= start + 1290 for start in starts))
+        generated_starts = {
+            int(window["start_frame"])
+            for window in runner.all_windows(self.index)
+        }
+        self.assertTrue(any(start not in generated_starts for start in starts))
+
+    def test_dense_windows_include_non_grid_cross_boundary_start(self) -> None:
+        dense = runner.dense_sliding_windows(self.index, ratios=(0.20,))
+        starts = [int(window["start_frame"]) for window in dense]
+        generated_starts = {
+            int(window["start_frame"])
+            for window in runner.all_windows(self.index)
+            if float(window["requested_video_ratio"]) == 0.20
+        }
+        self.assertTrue(any(start not in generated_starts for start in starts))
+        self.assertIn(180, starts)
 
     def test_occurrence_runs_do_not_join_different_cameras(self) -> None:
         evidence = synthetic_evidence(0, 30)[:2]
@@ -357,7 +379,7 @@ class TemporalSelectionTests(unittest.TestCase):
         self.assertEqual(scores["mean_presentation_quality"], 0.9)
         self.assertEqual(scores["mean_target_scale_score"], 0.8)
 
-    def test_large_clear_window_can_beat_more_verified_small_window(self) -> None:
+    def test_presentation_claim_cannot_override_verified_coverage(self) -> None:
         evidence = []
         for frame_id in range(40):
             evidence.append(
@@ -373,9 +395,9 @@ class TemporalSelectionTests(unittest.TestCase):
                     "inference_kind": "qwen",
                 }
             )
-        windows = []
+        source_windows = []
         for index, start in enumerate((0, 20)):
-            windows.append(
+            source_windows.append(
                 {
                     "window_id": f"cam01_window_{index:04d}",
                     "cam": "cam01",
@@ -392,13 +414,17 @@ class TemporalSelectionTests(unittest.TestCase):
             "cameras": {
                 "cam01": {
                     "video_frame_span": 39,
-                    "windows": windows,
+                    "windows": source_windows,
                 }
             }
         }
 
-        def verification(window_index: int, count: int, scale: float) -> dict:
-            start = windows[window_index]["start_frame"]
+        dense = runner.dense_sliding_windows(temporal_index, ratios=(0.20,))
+        first = next(window for window in dense if window["start_frame"] == 0)
+        second = next(window for window in dense if window["start_frame"] == 20)
+
+        def verification(window: dict, count: int, scale: float) -> dict:
+            start = window["start_frame"]
             frame_results = []
             for offset in range(count):
                 frame_results.append(
@@ -442,11 +468,11 @@ class TemporalSelectionTests(unittest.TestCase):
             {"object_identity": "object"},
             evidence,
             {
-                "cam01_window_0000": verification(0, 2, 0.95),
-                "cam01_window_0001": verification(1, 5, 0.25),
+                first["window_id"]: verification(first, 2, 0.95),
+                second["window_id"]: verification(second, 5, 0.25),
             },
         )
-        self.assertEqual(result["best_segment"]["window_id"], "cam01_window_0000")
+        self.assertEqual(result["best_segment"]["window_id"], second["window_id"])
 
     def test_candidate_panel_repeats_source_context_and_crop(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

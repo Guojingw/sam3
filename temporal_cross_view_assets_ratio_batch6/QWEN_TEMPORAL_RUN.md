@@ -5,62 +5,43 @@ Qwen3.5 with 4B parameters; it does not mean a 3.5B model.
 
 ## Decision pipeline
 
-1. Read each case's `metadata.json`, `source_best_frame.jpg`, and
-   `source_best_mask.png`.
-2. Create an isolated source RGB anchor from the binary mask. Overlay colors
-   are explicitly excluded from identity inference.
-3. Resolve each unique third-person sample back to its native image under the
-   take directory. Use a contact-sheet crop only when the source dataset is not
-   available, and record the input source and resolution in the result JSON.
-4. Use the largest first-person mask frame as the synchronized search origin.
-   Probe densely around that frame, then expand exponentially toward the video
-   boundaries rather than uniformly evaluating every frame.
-5. Give Qwen the query frame as a standalone image and the three-frame strip
-   only as context. Bounding boxes are normalized to the standalone query.
-6. Rank genuine positive scouts by identity, visibility, localization quality,
-   and source-time proximity. Expand both directions around at most six
-   non-overlapping seeds per camera. Intermediate frames receive support only
-   when bracketed by two real, spatially consistent localized detections.
-7. Build independent occurrence spans for each case.
-8. Divide every target-camera timeline into equal temporal bins and verify one
-   20% challenger from every bin. This prevents a source-near local optimum
-   from hiding a visually stronger segment elsewhere in the video.
-9. Recheck each challenger using five time-distributed standalone full frames
-   plus up to three strong scout frames. Do not use a compressed 3x3 contact
-   sheet as a hard decision input. Qwen returns one presence and bbox result per
-   standalone frame.
-10. Enlarge every proposed bbox into a candidate panel containing both local
-   context and the tight crop. Recompare it with the source-mask RGB anchor.
-   Require two visible identity-specific physical cues, no conflicting cue, and
-   reject crops too small or blurred to verify. Deterministic code derives the
-   window-level decision only after this second pass. Score object completeness,
-   bbox tightness, and object fill inside the box; loose background boxes do not
-   count as verified localization.
-11. If strict full-frame crop verification finds fewer than two matches, run a
-   bounded 3x3 overlapping-tile search on at most two frames from each of the
-   three highest-ranked windows. Run a separate tight-box localization call on
-   the native tile, map that box back to full-frame coordinates, then require a
-   separate strict crop-verification call.
-12. Prefer a generated 20% continuous window that captures the most evidence
-   from a localized occurrence. The target may be absent in surrounding window
-   context when its true occurrence is shorter than 20%; this is the equivalent
-   of padding the shorter side until the legal duration is reached.
-13. Treat two independently verified frames as the acceptance gate, then rank
-   legal windows by verification coverage (10%), identity (20%), occurrence
-   capture (15%), presentation quality (20%), visible target scale (20%), box
-   stability (5%), real-probe support (5%), and source-time proximity (5%).
-14. Deterministically reject a window unless it captures at least two supported
-   localized scout samples and at least two enlarged candidate crops pass strict
-   cross-view identity verification. Color similarity and a positive claim
-   without localization are insufficient.
-15. Compare the winner with the best non-overlapping, equal-duration global
-   challenger. Select the strongest verified continuous window or emit
-   `uncertain`.
-16. Rewrite `temporal_analysis_result.json`, render the comparison image, and
-   update `batch_temporal_analysis_summary.json`.
+This is a two-stage inference pipeline. Qwen proposes identity-verified dense
+windows; SAM3 makes the final mask-based temporal decision.
 
-The synchronized source frame is a search origin, not a hard target frame. If
-the visually strongest third-person occurrence is earlier or later, it wins.
+1. Read each case's `metadata.json`, first-person largest-mask frame, binary
+   mask, and overlay. Build an isolated RGB anchor so the overlay color cannot
+   be mistaken for the object's color.
+2. Use the synchronized source frame only as a weak search prior. Probe native
+   third-person frames near it first, then expand toward both timeline edges.
+3. Require Qwen detections to contain a normalized bbox and at least two
+   identity-specific physical cues. Color-only matches and scene activity do
+   not count.
+4. Build per-camera occurrence evidence. A short true occurrence is allowed:
+   the legal window may contain surrounding context as long as the occurrence
+   itself is captured.
+5. Enumerate every possible sampled-frame start for 20%, 25%, and 30% window
+   lengths. These are dense overlapping windows, not three fixed bins, so a
+   globally best window may cross any old segment boundary.
+6. Score all dense windows cheaply in deterministic CPU code, apply temporal
+   NMS, and send at most eight diverse Top-K windows back to Qwen for strict
+   full-frame and enlarged-crop identity verification.
+7. Qwen presentation, completeness, and scale values remain diagnostics only.
+   They cannot choose the final window. A separate shortlist score uses verified
+   identity, occurrence capture, real probe support, and the weak source prior.
+8. Pass up to five identity-verified windows to SAM3. Seed each track with a
+   verified Qwen bbox, propagate a binary mask across the complete candidate
+   window, and derive every displayed bbox directly from that mask.
+9. Rank SAM3 tracks by captured mask evidence, full-window coverage, longest
+   continuous run, target scale, area stability, bbox motion stability, and IoU
+   against at least two independently verified Qwen anchors.
+10. Select the highest-scoring legal continuous window only when it has two
+    anchor matches and beats the runner-up by the configured margin. Otherwise
+    emit `uncertain` instead of forcing a choice.
+11. Write schema-12 `temporal_analysis_result.json`, rerender the enlarged
+    source/selected/alternative comparison, and update the batch summary.
+
+The synchronized source frame is a search origin, not a hard target frame. The
+final segment is always continuous and occupies 20%-30% of its camera timeline.
 
 ## NSCC commands
 
@@ -101,8 +82,28 @@ Each job writes only its own case outputs, cache directory, and summary under
 `$WORK/job_summaries`. Do not run a serial job against the same work directory
 at the same time.
 
-After all jobs disappear from `qstat`, rebuild the complete six-case summary
-and render outputs without loading Qwen or requesting a GPU:
+After all Qwen jobs disappear from `qstat`, verify that each successful case is
+schema 11 and is waiting for SAM3:
+
+```bash
+for f in "$EASY6"/*/temporal_analysis_result.json; do
+  jq -r '[.case_id, .schema_version, .status, .pipeline_status,
+          (.sam3_rerank_candidates | length)] | @tsv' "$f"
+done
+```
+
+Then submit the SAM3 mask reranking stage. It can also run one case per PBS job:
+
+```bash
+bash submit_sam3_temporal_parallel.sh "$EASY6" "$WORK"
+qstat -u "$USER"
+```
+
+The `g1` queue may limit how many jobs one user can run concurrently. Jobs in
+state `Q` remain queued and start automatically as running jobs finish.
+
+After all SAM3 jobs disappear, rebuild the final six-case summary and rerender
+without loading Qwen or requesting a GPU:
 
 ```bash
 PYTHON="$HOME/.conda/envs/sam3/bin/python"
@@ -113,19 +114,20 @@ PYTHON="$HOME/.conda/envs/sam3/bin/python"
   --render-only
 ```
 
-Parallel execution reduces elapsed wall-clock time but consumes approximately
-the same total GPU-hours and is subject to project and queue concurrency limits.
-Use the new work directory shown above. Earlier frame caches used a different
-bbox coordinate system and window-verification schema and must not be mixed
-with this run.
+The final result must be schema 12 with `pipeline_status=complete`. Schema 11
+is only the Qwen candidate stage and must not be treated as the final answer:
 
-Result schema 10 keeps schema-9 native-frame scouts but invalidates old window
-verifications. Reusing `temporal_easy6_native_tiles_v3` without `--force`
-recomputes only candidate-window localization/verification and final ranking.
-Result schema 9 deliberately invalidated old low-resolution frame evidence.
-Use the new work directory above instead of mixing schema 8 contact-sheet crops
-with native-frame evidence. Tile rescue is bounded and runs only after ordinary
-full-frame localization and strict crop verification fail.
+```bash
+for f in "$EASY6"/*/temporal_analysis_result.json; do
+  jq -r '[.case_id, .schema_version, .status, .pipeline_status,
+          (.best_segment.window_id // "NONE")] | @tsv' "$f"
+done
+```
+
+Parallel execution reduces elapsed wall-clock time but consumes approximately
+the same total GPU-hours and remains subject to the queue concurrency limit.
+Use one work directory for one run. Earlier low-resolution caches must not be
+mixed with `temporal_easy6_native_tiles_v3`.
 
 The frame evidence for the command above is saved under:
 
@@ -133,9 +135,9 @@ The frame evidence for the command above is saved under:
 /scratch/users/ntu/gwang016/qwen35-4b/temporal_easy6_native_tiles_v3/
 ```
 
-Rerunning the PBS script resumes from cached completed frames. To discard the
-cache for one case, pass `--force --case sugar_container` in an interactive
-run. Do not use `--force` for ordinary resume.
+Rerunning the Qwen PBS script resumes from cached completed frames. Dense window
+enumeration itself runs on CPU; only newly selected strict-verification windows
+cause additional Qwen calls. Do not use `--force` for an ordinary resume.
 
 Render again without loading Qwen or requesting a GPU:
 
@@ -206,7 +208,7 @@ du -sh /scratch/users/ntu/$USER/qwen35-4b/* \
   /scratch/users/ntu/$USER/*prompt_assets* 2>/dev/null | sort -h
 ```
 
-After schema 9 has completed and its rendered outputs have been checked, these
+After schema 12 has completed and its rendered outputs have been checked, these
 names are historical candidates for quarantine rather than immediate deletion:
 
 ```text

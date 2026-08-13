@@ -1,5 +1,5 @@
 #!/bin/bash
-# Submit one independent one-GPU PBS job per temporal case.
+# Submit one independent one-GPU SAM3 reranking job per temporal case.
 
 set -euo pipefail
 
@@ -12,7 +12,7 @@ ASSETS="$(readlink -f "$1")"
 mkdir -p "$2"
 WORK_DIR="$(readlink -f "$2")"
 RUNNER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SUMMARY_DIR="$WORK_DIR/job_summaries/qwen"
+SUMMARY_DIR="$WORK_DIR/job_summaries/sam3"
 mkdir -p "$SUMMARY_DIR"
 
 index=0
@@ -25,9 +25,9 @@ for case_dir in "$ASSETS"/*__*; do
   summary_path="$SUMMARY_DIR/$case_id.json"
   job_id="$(
     qsub \
-      -N "q4b_case_${index}" \
+      -N "sam3_case_${index}" \
       -v "ASSETS=$ASSETS,WORK_DIR=$WORK_DIR,CASE_FILTER=$case_id,SUMMARY_PATH=$summary_path" \
-      "$RUNNER_DIR/run_qwen_temporal_batch.pbs"
+      "$RUNNER_DIR/run_sam3_temporal_rerank.pbs"
   )"
   printf '%s\t%s\t%s\n' "$job_id" "$case_id" "$summary_path"
 done
@@ -37,4 +37,4 @@ if [[ $index -eq 0 ]]; then
   exit 1
 fi
 
-echo "Submitted $index independent Qwen jobs."
+echo "Submitted $index independent SAM3 jobs."
