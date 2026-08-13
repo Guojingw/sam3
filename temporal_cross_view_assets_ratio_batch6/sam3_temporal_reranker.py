@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Rerank dense temporal candidates using SAM3 mask tracks."""
+"""Render final selected-window frames with independent SAM3 masks.
+
+Qwen owns temporal selection. SAM3 is deliberately limited to final visual
+segmentation and never changes the selected window or temporal status.
+"""
 
 from __future__ import annotations
 
 import argparse
-import math
 import shutil
 import sys
 import traceback
@@ -17,10 +20,9 @@ from PIL import Image
 import qwen_temporal_runner as temporal
 
 
-RERANK_SCHEMA_VERSION = 2
-RESULT_SCHEMA_VERSION = 12
+FINAL_SEGMENTATION_SCHEMA_VERSION = 1
+RESULT_SCHEMA_VERSION = 13
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
-APPLY_TEMPORAL_DISAMBIGUATION = False
 
 
 def parse_args() -> argparse.Namespace:
@@ -30,8 +32,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--case", action="append", default=[])
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--summary-path", type=Path)
-    parser.add_argument("--max-candidates", type=int, default=5)
-    parser.add_argument("--minimum-score-margin", type=float, default=0.03)
     parser.add_argument("--render-only", action="store_true")
     return parser.parse_args()
 
@@ -45,27 +45,7 @@ def box_xyxy_to_xywh(box: Sequence[float]) -> list[float]:
     ]
 
 
-def box_iou(left: Sequence[float], right: Sequence[float]) -> float:
-    intersection = max(0.0, min(left[2], right[2]) - max(left[0], right[0])) * max(
-        0.0, min(left[3], right[3]) - max(left[1], right[1])
-    )
-    left_area = temporal.normalized_box_area(left)
-    right_area = temporal.normalized_box_area(right)
-    return intersection / max(1e-9, left_area + right_area - intersection)
-
-
-def box_reference_coverage(
-    candidate: Sequence[float], reference: Sequence[float]
-) -> float:
-    intersection = max(
-        0.0, min(candidate[2], reference[2]) - max(candidate[0], reference[0])
-    ) * max(
-        0.0, min(candidate[3], reference[3]) - max(candidate[1], reference[1])
-    )
-    return intersection / max(1e-9, temporal.normalized_box_area(reference))
-
-
-def expand_box(box: Sequence[float], factor: float) -> list[float]:
+def expand_box(box: Sequence[float], factor: float = 1.35) -> list[float]:
     center_x = (float(box[0]) + float(box[2])) / 2.0
     center_y = (float(box[1]) + float(box[3])) / 2.0
     half_width = (float(box[2]) - float(box[0])) * factor / 2.0
@@ -91,110 +71,108 @@ def mask_bbox(mask: np.ndarray) -> list[float] | None:
     ]
 
 
-def output_arrays(outputs: Mapping[str, Any]) -> tuple[np.ndarray, np.ndarray]:
-    raw_object_ids = outputs.get("out_obj_ids", [])
-    raw_masks = outputs.get("out_binary_masks", [])
-    if hasattr(raw_object_ids, "detach"):
-        raw_object_ids = raw_object_ids.detach().cpu().numpy()
-    if hasattr(raw_masks, "detach"):
-        raw_masks = raw_masks.detach().cpu().numpy()
-    object_ids = np.asarray(raw_object_ids).reshape(-1)
-    masks = np.asarray(raw_masks)
+def box_iou(left: Sequence[float], right: Sequence[float]) -> float:
+    intersection = max(0.0, min(left[2], right[2]) - max(left[0], right[0])) * max(
+        0.0, min(left[3], right[3]) - max(left[1], right[1])
+    )
+    left_area = temporal.normalized_box_area(left)
+    right_area = temporal.normalized_box_area(right)
+    return intersection / max(1e-9, left_area + right_area - intersection)
+
+
+def reference_coverage(candidate: Sequence[float], reference: Sequence[float]) -> float:
+    intersection = max(
+        0.0, min(candidate[2], reference[2]) - max(candidate[0], reference[0])
+    ) * max(
+        0.0, min(candidate[3], reference[3]) - max(candidate[1], reference[1])
+    )
+    return intersection / max(1e-9, temporal.normalized_box_area(reference))
+
+
+def output_arrays(
+    outputs: Mapping[str, Any],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    values = []
+    for key in ("out_obj_ids", "out_binary_masks", "out_probs"):
+        value = outputs.get(key, [])
+        if hasattr(value, "detach"):
+            value = value.detach().cpu().numpy()
+        values.append(np.asarray(value))
+    object_ids = values[0].reshape(-1)
+    masks = values[1]
+    probabilities = values[2].reshape(-1)
     if masks.ndim == 4 and masks.shape[1] == 1:
         masks = masks[:, 0]
     if masks.ndim == 2:
         masks = masks[None]
-    return object_ids, masks
+    if len(probabilities) < len(object_ids):
+        probabilities = np.pad(
+            probabilities,
+            (0, len(object_ids) - len(probabilities)),
+            constant_values=0.0,
+        )
+    return object_ids, masks, probabilities
 
 
-def output_mask_for_object(
-    outputs: Mapping[str, Any], object_id: int | None
-) -> tuple[int | None, np.ndarray | None]:
-    object_ids, masks = output_arrays(outputs)
-    if len(object_ids) == 0 or len(masks) == 0:
-        return object_id, None
-    if object_id is None:
-        object_id = int(object_ids[0])
-    matches = np.nonzero(object_ids.astype(int) == int(object_id))[0]
-    if len(matches) == 0:
-        return object_id, None
-    return object_id, masks[int(matches[0])].astype(bool)
-
-
-def prompt_aligned_output_mask(
-    outputs: Mapping[str, Any], prompt_box: Sequence[float]
-) -> tuple[int | None, np.ndarray | None, float]:
-    """Select the prompted SAM object, never an arbitrary first object ID."""
-    object_ids, masks = output_arrays(outputs)
-    candidates = []
+def choose_final_mask(
+    outputs: Mapping[str, Any], expected_box: Sequence[float] | None
+) -> dict[str, Any] | None:
+    """Choose a semantic SAM mask; Qwen geometry is only a weak prior."""
+    object_ids, masks, probabilities = output_arrays(outputs)
+    choices = []
     for index, object_id in enumerate(object_ids.astype(int)):
         if index >= len(masks):
             continue
         mask = masks[index].astype(bool)
+        area = float(mask.mean())
         box = mask_bbox(mask)
-        if box is None:
+        if box is None or not 0.0001 <= area <= 0.60:
             continue
-        candidates.append(
-            (
-                box_reference_coverage(box, prompt_box),
-                box_iou(box, prompt_box),
-                int(object_id),
-                mask,
-            )
+        probability = float(probabilities[index]) if index < len(probabilities) else 0.0
+        overlap = box_iou(box, expected_box) if expected_box else 0.0
+        coverage = reference_coverage(box, expected_box) if expected_box else 0.0
+        # Semantic text owns mask identity. The approximate Qwen box only
+        # breaks close ties and never acts as the primary SAM3 prompt.
+        score = 0.95 * probability + 0.03 * coverage + 0.02 * overlap
+        choices.append(
+            {
+                "object_id": int(object_id),
+                "mask": mask,
+                "mask_bbox_xyxy_normalized": box,
+                "mask_area_ratio": area,
+                "semantic_probability": probability,
+                "expected_box_iou": overlap,
+                "expected_box_coverage": coverage,
+                "selection_score": score,
+            }
         )
-    if not candidates:
-        return None, None, 0.0
-    _, overlap, object_id, mask = max(
-        candidates, key=lambda item: (item[0], item[1])
-    )
-    return object_id, mask, float(overlap)
+    if not choices:
+        return None
+    return max(choices, key=lambda item: item["selection_score"])
 
 
-def materialize_window_frames(
-    candidate: Mapping[str, Any],
-    catalog: Mapping[tuple[str, int], Path],
-    output_dir: Path,
-) -> None:
+def materialize_single_frame(source: Path, output_dir: Path) -> None:
     if output_dir.exists():
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    cam = str(candidate["cam"])
-    for index, frame_id in enumerate(candidate["frame_ids"]):
-        source = catalog[(cam, int(frame_id))].resolve()
-        destination = output_dir / f"{index:06d}.jpg"
-        if source.suffix.lower() in {".jpg", ".jpeg"}:
-            try:
-                destination.symlink_to(source)
-            except OSError:
-                shutil.copy2(source, destination)
-        else:
-            Image.open(source).convert("RGB").save(destination, quality=96)
+    destination = output_dir / "000000.jpg"
+    if source.suffix.lower() in {".jpg", ".jpeg"}:
+        try:
+            destination.symlink_to(source.resolve())
+        except OSError:
+            shutil.copy2(source, destination)
+    else:
+        Image.open(source).convert("RGB").save(destination, quality=97)
 
 
-def longest_true_run(values: Sequence[bool]) -> int:
-    longest = current = 0
-    for value in values:
-        current = current + 1 if value else 0
-        longest = max(longest, current)
-    return longest
-
-
-def track_candidate_once(
+def run_single_frame_prompt(
     predictor: Any,
-    candidate: Mapping[str, Any],
-    catalog: Mapping[tuple[str, int], Path],
-    track_root: Path,
-    seed_frame_id: int,
-    seed_box: Sequence[float],
-    prompt_box: Sequence[float],
-    prompt_scale: float,
-) -> dict[str, Any]:
-    window_id = str(candidate["window_id"])
-    frame_ids = [int(value) for value in candidate["frame_ids"]]
-    seed_index = frame_ids.index(seed_frame_id)
-    frame_dir = track_root / window_id / "frames"
-    materialize_window_frames(candidate, catalog, frame_dir)
-
+    frame_path: Path,
+    frame_dir: Path,
+    text_prompt: str | None,
+    box_prompt: Sequence[float] | None,
+) -> Mapping[str, Any]:
+    materialize_single_frame(frame_path, frame_dir)
     session = predictor.handle_request(
         {
             "type": "start_session",
@@ -203,460 +181,218 @@ def track_candidate_once(
         }
     )
     session_id = session["session_id"]
-    masks_by_index: dict[int, np.ndarray] = {}
     try:
-        prompt_request = {
+        request: dict[str, Any] = {
             "type": "add_prompt",
             "session_id": session_id,
-            "frame_index": seed_index,
-            "bounding_boxes": [box_xyxy_to_xywh(prompt_box)],
-            "bounding_box_labels": [1],
+            "frame_index": 0,
         }
-        prompt_text = str(candidate.get("sam_prompt_text", "")).strip()
-        if prompt_text:
-            prompt_request["text"] = prompt_text
-        prompted = predictor.handle_request(prompt_request)
-        object_id, seed_mask, prompt_mask_iou = prompt_aligned_output_mask(
-            prompted["outputs"], seed_box
-        )
-        if seed_mask is not None:
-            masks_by_index[seed_index] = seed_mask
-        if object_id is not None:
-            for response in predictor.handle_stream_request(
-                {
-                    "type": "propagate_in_video",
-                    "session_id": session_id,
-                    "propagation_direction": "both",
-                }
-            ):
-                object_id, mask = output_mask_for_object(
-                    response["outputs"], object_id
-                )
-                if mask is not None:
-                    masks_by_index[int(response["frame_index"])] = mask
+        if text_prompt:
+            request["text"] = text_prompt
+        if box_prompt:
+            request["bounding_boxes"] = [box_xyxy_to_xywh(box_prompt)]
+            request["bounding_box_labels"] = [1]
+        return predictor.handle_request(request)["outputs"]
     finally:
         predictor.handle_request(
             {"type": "close_session", "session_id": session_id}
         )
 
-    records: list[dict[str, Any]] = []
-    masks_by_frame: dict[int, np.ndarray] = {}
-    for index, frame_id in enumerate(frame_ids):
-        mask = masks_by_index.get(index)
-        if mask is None:
-            records.append(
+
+def segment_final_frame(
+    predictor: Any,
+    frame_path: Path,
+    frame_dir: Path,
+    object_identity: str,
+    expected_box: Sequence[float] | None,
+) -> tuple[dict[str, Any] | None, str]:
+    text_outputs = run_single_frame_prompt(
+        predictor,
+        frame_path,
+        frame_dir / "text",
+        object_identity,
+        None,
+    )
+    selected = choose_final_mask(text_outputs, expected_box)
+    if selected:
+        return selected, "semantic_text"
+    if expected_box is None:
+        return selected, "semantic_text_low_confidence"
+    box_outputs = run_single_frame_prompt(
+        predictor,
+        frame_path,
+        frame_dir / "box",
+        object_identity,
+        expand_box(expected_box),
+    )
+    box_selected = choose_final_mask(box_outputs, expected_box)
+    if box_selected is None:
+        return selected, "semantic_text_low_confidence"
+    return box_selected, "semantic_text_plus_box"
+
+
+def selected_window(
+    result: Mapping[str, Any], temporal_index: Mapping[str, Any]
+) -> dict[str, Any] | None:
+    best = result.get("qwen_temporal_selection") or result.get("best_segment")
+    if best:
+        return dict(best)
+    candidates = result.get("sam3_rerank_candidates", [])
+    if candidates:
+        candidate = candidates[0]
+        return {
+            key: candidate.get(key)
+            for key in (
+                "window_id",
+                "cam",
+                "start_frame",
+                "end_frame",
+                "requested_video_ratio",
+                "actual_sampled_frame_ratio",
+                "actual_frame_span_ratio",
+            )
+        }
+    return None
+
+
+def window_record(
+    selection: Mapping[str, Any], temporal_index: Mapping[str, Any]
+) -> Mapping[str, Any]:
+    windows = {
+        str(item["window_id"]): item
+        for item in [
+            *temporal.all_windows(temporal_index),
+            *temporal.dense_sliding_windows(temporal_index),
+        ]
+    }
+    return windows[str(selection["window_id"])]
+
+
+def verified_box_map(
+    result: Mapping[str, Any], window_id: str
+) -> dict[int, list[float]]:
+    output = {}
+    verification = result.get("window_verifications", {}).get(window_id, {})
+    for item in verification.get("frame_results", []):
+        box = temporal.normalized_box(item.get("bbox_xyxy_normalized"))
+        if item.get("target_present") and box:
+            output[int(item["frame_id"])] = box
+    for candidate in result.get("sam3_rerank_candidates", []):
+        if candidate.get("window_id") != window_id:
+            continue
+        for item in candidate.get("verified_seed_frames", []):
+            box = temporal.normalized_box(item.get("bbox_xyxy_normalized"))
+            if box:
+                output[int(item["frame_id"])] = box
+    return output
+
+
+def nearest_box(
+    boxes: Mapping[int, Sequence[float]], frame_id: int
+) -> list[float] | None:
+    if not boxes:
+        return None
+    nearest_id = min(boxes, key=lambda value: abs(int(value) - frame_id))
+    return list(boxes[nearest_id])
+
+
+def save_mask(case_dir: Path, cam: str, frame_id: int, mask: np.ndarray) -> str:
+    output_dir = case_dir / "analysis_outputs" / "final_sam3_masks"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / f"{cam}_frame_{frame_id:06d}.png"
+    Image.fromarray(mask.astype(np.uint8) * 255).save(path)
+    return str(path.relative_to(case_dir))
+
+
+def finalize_result(
+    predictor: Any,
+    case_dir: Path,
+    work_case: Path,
+    result: dict[str, Any],
+    temporal_index: Mapping[str, Any],
+    catalog: Mapping[tuple[str, int], Path],
+) -> dict[str, Any]:
+    selection = selected_window(result, temporal_index)
+    result.pop("sam3_rerank", None)
+    result.pop("sam3_frame_evidence", None)
+    result.pop("sam3_rerank_candidates", None)
+    if selection is None:
+        result["final_segmentation"] = {
+            "schema_version": FINAL_SEGMENTATION_SCHEMA_VERSION,
+            "role": "visualization_only",
+            "frame_results": [],
+            "warning": "No Qwen-selected temporal window exists to segment.",
+        }
+        result["schema_version"] = RESULT_SCHEMA_VERSION
+        result["pipeline_status"] = "complete"
+        return result
+
+    window = window_record(selection, temporal_index)
+    cam = str(window["cam"])
+    display_ids = temporal.representative_ids(window["frame_ids"], 5)
+    boxes = verified_box_map(result, str(window["window_id"]))
+    identity = str(
+        result.get("source_identity", {}).get("object_identity")
+        or result.get("target_object", "object")
+    )
+    frame_results = []
+    for position, frame_id in enumerate(display_ids, start=1):
+        print(
+            f"[final mask {position}/{len(display_ids)}] {cam} frame {frame_id}",
+            flush=True,
+        )
+        expected = nearest_box(boxes, int(frame_id))
+        selected, method = segment_final_frame(
+            predictor,
+            catalog[(cam, int(frame_id))],
+            work_case / "sam3_final_frames" / f"{cam}_{frame_id}",
+            identity,
+            expected,
+        )
+        if selected is None:
+            frame_results.append(
                 {
-                    "frame_id": frame_id,
+                    "cam": cam,
+                    "frame_id": int(frame_id),
                     "target_present": False,
-                    "mask_area_ratio": 0.0,
-                    "mask_bbox_xyxy_normalized": None,
+                    "method": method,
+                    "mask_path": None,
                 }
             )
             continue
-        area_ratio = float(mask.mean())
-        present = 0.0001 <= area_ratio <= 0.75
-        box = mask_bbox(mask) if present else None
-        if present:
-            masks_by_frame[frame_id] = mask
-        records.append(
+        mask_path = save_mask(
+            case_dir, cam, int(frame_id), selected.pop("mask")
+        )
+        frame_results.append(
             {
-                "frame_id": frame_id,
-                "target_present": present,
-                "mask_area_ratio": area_ratio if present else 0.0,
-                "mask_bbox_xyxy_normalized": box,
+                "cam": cam,
+                "frame_id": int(frame_id),
+                "target_present": True,
+                "method": method,
+                "mask_path": mask_path,
+                **selected,
             }
         )
 
-    present_values = [bool(item["target_present"]) for item in records]
-    present_records = [item for item in records if item["target_present"]]
-    areas = [float(item["mask_area_ratio"]) for item in present_records]
-    verified_boxes = {
-        int(item["frame_id"]): item["bbox_xyxy_normalized"]
-        for item in candidate.get("verified_seed_frames", [])
-    }
-    records_by_frame = {int(item["frame_id"]): item for item in records}
-    anchor_ious = []
-    for frame_id, verified_box in verified_boxes.items():
-        tracked = records_by_frame.get(frame_id)
-        if not tracked or not tracked["target_present"]:
-            anchor_ious.append(0.0)
-            continue
-        anchor_ious.append(
-            box_iou(tracked["mask_bbox_xyxy_normalized"], verified_box)
-        )
-    anchor_match_count = sum(value >= 0.10 for value in anchor_ious)
-    coverage = len(present_records) / max(1, len(records))
-    continuity = longest_true_run(present_values) / max(1, len(records))
-    mean_area = float(np.mean(areas)) if areas else 0.0
-    area_stability = (
-        max(0.0, 1.0 - float(np.std(areas)) / max(1e-9, mean_area))
-        if len(areas) >= 2
-        else 0.0
-    )
-    anchor_consistency = float(np.mean(anchor_ious)) if anchor_ious else 0.0
-    centers = [
-        (
-            (item["mask_bbox_xyxy_normalized"][0]
-             + item["mask_bbox_xyxy_normalized"][2]) / 2.0,
-            (item["mask_bbox_xyxy_normalized"][1]
-             + item["mask_bbox_xyxy_normalized"][3]) / 2.0,
-        )
-        for item in present_records
-    ]
-    center_jumps = [
-        math.dist(centers[index - 1], centers[index])
-        for index in range(1, len(centers))
-    ]
-    motion_stability = (
-        max(0.0, 1.0 - float(np.mean(center_jumps)) / 0.25)
-        if center_jumps
-        else 0.0
-    )
-    raw_evidence = sum(areas)
-    seed_mask_box = mask_bbox(seed_mask) if seed_mask is not None else None
-    seed_anchor_coverage = (
-        box_reference_coverage(seed_mask_box, seed_box)
-        if seed_mask_box is not None
-        else 0.0
-    )
-    seed_box_area = temporal.normalized_box_area(seed_box)
-    seed_mask_box_area_ratio = (
-        temporal.normalized_box_area(seed_mask_box) / max(1e-9, seed_box_area)
-        if seed_mask_box is not None
-        else 0.0
-    )
-    return {
-        "rerank_schema_version": RERANK_SCHEMA_VERSION,
-        "window_id": window_id,
-        "cam": candidate["cam"],
-        "start_frame": candidate["start_frame"],
-        "end_frame": candidate["end_frame"],
-        "requested_video_ratio": candidate["requested_video_ratio"],
-        "actual_sampled_frame_ratio": candidate.get("actual_sampled_frame_ratio"),
-        "actual_frame_span_ratio": candidate.get("actual_frame_span_ratio"),
-        "seed_frame_id": seed_frame_id,
-        "seed_bbox_xyxy_normalized": seed_box,
-        "sam_prompt_bbox_xyxy_normalized": list(prompt_box),
-        "sam_prompt_scale": prompt_scale,
-        "sam_prompt_text": candidate.get("sam_prompt_text"),
-        "tracked_object_id": object_id,
-        "frame_results": records,
-        "mask_track_metrics": {
-            "present_frame_count": len(present_records),
-            "tested_frame_count": len(records),
-            "coverage_fraction": coverage,
-            "longest_continuous_fraction": continuity,
-            "mean_mask_area_ratio": mean_area,
-            "total_mask_area_evidence": raw_evidence,
-            "mask_area_stability": area_stability,
-            "verified_anchor_iou": anchor_consistency,
-            "verified_anchor_count": len(verified_boxes),
-            "verified_anchor_match_count": anchor_match_count,
-            "prompt_mask_iou": prompt_mask_iou,
-            "seed_anchor_coverage": seed_anchor_coverage,
-            "seed_mask_box_area_ratio": seed_mask_box_area_ratio,
-            "bbox_motion_stability": motion_stability,
-        },
-        "_masks_by_frame": masks_by_frame,
-    }
-
-
-def track_candidate(
-    predictor: Any,
-    candidate: Mapping[str, Any],
-    catalog: Mapping[tuple[str, int], Path],
-    track_root: Path,
-) -> dict[str, Any]:
-    primary = {
-        "frame_id": int(candidate["seed_frame_id"]),
-        "bbox_xyxy_normalized": candidate["seed_bbox_xyxy_normalized"],
-    }
-    seeds = [primary, *candidate.get("verified_seed_frames", [])]
-    unique_seeds = []
-    seen = set()
-    for seed in seeds:
-        key = (
-            int(seed["frame_id"]),
-            tuple(float(value) for value in seed["bbox_xyxy_normalized"]),
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        unique_seeds.append(seed)
-        if len(unique_seeds) >= 3:
-            break
-
-    trials = []
-    for seed in unique_seeds:
-        seed_trials = []
-        for prompt_scale in (1.0, 1.5, 2.0):
-            trial = track_candidate_once(
-                predictor,
-                candidate,
-                catalog,
-                track_root,
-                int(seed["frame_id"]),
-                seed["bbox_xyxy_normalized"],
-                expand_box(seed["bbox_xyxy_normalized"], prompt_scale),
-                prompt_scale,
-            )
-            trials.append(trial)
-            seed_trials.append(trial)
-            metrics = trial["mask_track_metrics"]
-            if (
-                prompt_scale >= 1.5
-                and int(metrics["verified_anchor_match_count"]) >= 2
-                and float(metrics["seed_anchor_coverage"]) >= 0.75
-                and int(metrics["present_frame_count"]) >= 2
-            ):
-                break
-        if any(
-            int(trial["mask_track_metrics"]["verified_anchor_match_count"]) >= 2
-            and float(trial["mask_track_metrics"]["seed_anchor_coverage"]) >= 0.75
-            and int(trial["mask_track_metrics"]["present_frame_count"]) >= 2
-            for trial in seed_trials
-        ):
-            break
-
-    winner = max(
-        trials,
-        key=lambda item: (
-            int(item["mask_track_metrics"]["verified_anchor_match_count"]),
-            float(item["mask_track_metrics"]["seed_anchor_coverage"]) >= 0.60,
-            float(item["mask_track_metrics"]["longest_continuous_fraction"]),
-            float(item["mask_track_metrics"]["coverage_fraction"]),
-            float(item["mask_track_metrics"]["seed_anchor_coverage"]),
-            float(item["mask_track_metrics"]["mean_mask_area_ratio"]),
-            float(item["mask_track_metrics"]["verified_anchor_iou"]),
-        ),
-    )
-    winner["seed_trials"] = [
-        {
-            "seed_frame_id": trial["seed_frame_id"],
-            "seed_bbox_xyxy_normalized": trial["seed_bbox_xyxy_normalized"],
-            "sam_prompt_bbox_xyxy_normalized": trial[
-                "sam_prompt_bbox_xyxy_normalized"
-            ],
-            "sam_prompt_scale": trial["sam_prompt_scale"],
-            "metrics": trial["mask_track_metrics"],
-            "selected_for_window": trial is winner,
-        }
-        for trial in trials
-    ]
-    return winner
-
-
-def score_tracks(tracks: list[dict[str, Any]]) -> None:
-    maximum_evidence = max(
-        (
-            float(item["mask_track_metrics"]["total_mask_area_evidence"])
-            for item in tracks
-        ),
-        default=0.0,
-    )
-    maximum_mean_area = max(
-        (
-            float(item["mask_track_metrics"]["mean_mask_area_ratio"])
-            for item in tracks
-        ),
-        default=0.0,
-    )
-    for item in tracks:
-        metrics = item["mask_track_metrics"]
-        captured = float(metrics["total_mask_area_evidence"]) / max(
-            1e-9, maximum_evidence
-        )
-        scale = float(metrics["mean_mask_area_ratio"]) / max(
-            1e-9, maximum_mean_area
-        )
-        metrics["normalized_captured_mask_evidence"] = captured
-        metrics["normalized_target_scale"] = scale
-        metrics["sam3_selection_score"] = (
-            0.20 * captured
-            + 0.20 * float(metrics["coverage_fraction"])
-            + 0.20 * float(metrics["longest_continuous_fraction"])
-            + 0.15 * scale
-            + 0.10 * float(metrics["verified_anchor_iou"])
-            + 0.10 * float(metrics["seed_anchor_coverage"])
-            + 0.025 * float(metrics["mask_area_stability"])
-            + 0.025 * float(metrics["bbox_motion_stability"])
-        )
-
-
-def save_candidate_diagnostic_masks(
-    case_dir: Path, candidate: dict[str, Any]
-) -> None:
-    masks = candidate.get("_masks_by_frame", {})
-    if not masks:
-        return
-    window_id = str(candidate["window_id"])
-    output_dir = (
-        case_dir / "analysis_outputs" / "sam3_candidate_masks" / window_id
-    )
-    if output_dir.exists():
-        shutil.rmtree(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    present_ids = sorted(int(frame_id) for frame_id in masks)
-    display_ids = set(temporal.representative_ids(present_ids, 5))
-    if candidate.get("seed_frame_id") is not None:
-        display_ids.add(int(candidate["seed_frame_id"]))
-    mask_paths = {}
-    for frame_id in display_ids:
-        mask = masks.get(frame_id)
-        if mask is None:
-            continue
-        path = output_dir / f"frame_{frame_id:06d}.png"
-        Image.fromarray(mask.astype(np.uint8) * 255).save(path)
-        mask_paths[frame_id] = str(path.relative_to(case_dir))
-    for item in candidate["frame_results"]:
-        path = mask_paths.get(int(item["frame_id"]))
-        if path:
-            item["mask_path"] = path
-
-
-def save_selected_masks(
-    case_dir: Path, selected: dict[str, Any]
-) -> list[dict[str, Any]]:
-    output_dir = case_dir / "analysis_outputs" / "sam3_masks"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    frame_ids = [int(item["frame_id"]) for item in selected["frame_results"]]
-    display_ids = set(temporal.representative_ids(frame_ids, 5))
-    mask_paths: dict[int, str] = {}
-    for frame_id, mask in selected.pop("_masks_by_frame").items():
-        if frame_id not in display_ids:
-            continue
-        path = output_dir / f"frame_{frame_id:06d}.png"
-        Image.fromarray(mask.astype(np.uint8) * 255).save(path)
-        mask_paths[frame_id] = str(path.relative_to(case_dir))
-    for item in selected["frame_results"]:
-        if int(item["frame_id"]) in mask_paths:
-            item["mask_path"] = mask_paths[int(item["frame_id"])]
-    return selected["frame_results"]
-
-
-def update_result(
-    case_dir: Path,
-    result: dict[str, Any],
-    tracks: list[dict[str, Any]],
-    minimum_score_margin: float,
-) -> dict[str, Any]:
-    result.pop("sam3_frame_evidence", None)
-    score_tracks(tracks)
-    tracks.sort(
-        key=lambda item: float(
-            item["mask_track_metrics"]["sam3_selection_score"]
-        ),
-        reverse=True,
-    )
-    for track in tracks:
-        save_candidate_diagnostic_masks(case_dir, track)
-    serializable = []
-    for track in tracks:
-        copy = dict(track)
-        copy.pop("_masks_by_frame", None)
-        serializable.append(copy)
-    result["sam3_rerank"] = {
-        "schema_version": RERANK_SCHEMA_VERSION,
-        "candidate_count": len(tracks),
-        "candidates": serializable,
-        "selected_window_id": None,
-        "score_margin": None,
-    }
-    if not tracks:
-        result["status"] = "uncertain"
-        result["best_cam"] = None
-        result["best_segment"] = None
-        result["global_challenger_comparison"] = None
-        result["uncertainty"] = "SAM3 received no valid dense-window seed candidates."
-        result["schema_version"] = RESULT_SCHEMA_VERSION
-        result["pipeline_status"] = "complete"
-        result["confidence"] = 0.0
-        return result
-
-    winner = tracks[0]
-    runner_up_score = (
-        float(tracks[1]["mask_track_metrics"]["sam3_selection_score"])
-        if len(tracks) > 1
-        else 0.0
-    )
-    winner_score = float(
-        winner["mask_track_metrics"]["sam3_selection_score"]
-    )
-    margin = winner_score - runner_up_score
-    metrics = winner["mask_track_metrics"]
-    accepted = bool(
-        int(metrics["present_frame_count"]) >= 2
-        and float(metrics["prompt_mask_iou"]) >= 0.10
-        and float(metrics["seed_anchor_coverage"]) >= 0.60
-        and float(metrics["verified_anchor_iou"]) >= 0.10
-        and int(metrics["verified_anchor_count"]) >= 2
-        and int(metrics["verified_anchor_match_count"]) >= 2
-        and margin >= minimum_score_margin
-    )
-    failed_gates = []
-    if int(metrics["present_frame_count"]) < 2:
-        failed_gates.append("fewer than two tracked mask frames")
-    if float(metrics["prompt_mask_iou"]) < 0.10:
-        failed_gates.append("SAM3 prompt mask does not overlap its Qwen seed box")
-    if float(metrics["seed_anchor_coverage"]) < 0.60:
-        failed_gates.append(
-            "SAM3 mask covers less than 60% of its Qwen identity anchor"
-        )
-    if int(metrics["verified_anchor_count"]) < 2:
-        failed_gates.append("fewer than two independent Qwen anchors")
-    if int(metrics["verified_anchor_match_count"]) < 2:
-        failed_gates.append("fewer than two SAM3/Qwen anchor matches")
-    if float(metrics["verified_anchor_iou"]) < 0.10:
-        failed_gates.append("mean anchor IoU below 0.10")
-    if margin < minimum_score_margin:
-        failed_gates.append(
-            f"winner margin {margin:.4f} below {minimum_score_margin:.4f}"
-        )
-    result["sam3_rerank"]["acceptance_gate"] = {
-        "passed": accepted,
-        "failed_conditions": failed_gates,
-    }
-    result["sam3_rerank"]["score_margin"] = margin
-    result["global_challenger_comparison"] = {
-        "passed": margin >= minimum_score_margin,
-        "selected_score": winner_score,
-        "challenger_window_id": tracks[1]["window_id"] if len(tracks) > 1 else None,
-        "challenger_score": runner_up_score if len(tracks) > 1 else None,
-        "score_margin": margin,
-    }
+    result["best_segment"] = selection
+    result["best_cam"] = selection["cam"]
+    result["status"] = "success"
+    result["uncertainty"] = ""
     result["schema_version"] = RESULT_SCHEMA_VERSION
     result["pipeline_status"] = "complete"
-    result["confidence"] = winner_score if accepted else 0.0
-    if not accepted:
-        result["status"] = "uncertain"
-        result["best_cam"] = None
-        result["best_segment"] = None
-        result["uncertainty"] = (
-            "SAM3 mask-track acceptance failed: " + "; ".join(failed_gates)
-        )
-        return result
-
-    frame_results = save_selected_masks(case_dir, winner)
-    result["sam3_rerank"]["selected_window_id"] = winner["window_id"]
-    result["sam3_frame_evidence"] = frame_results
-    result["status"] = "success"
-    result["best_cam"] = winner["cam"]
-    result["uncertainty"] = ""
-    result["best_segment"] = {
-        "window_id": winner["window_id"],
-        "cam": winner["cam"],
-        "start_frame": winner["start_frame"],
-        "end_frame": winner["end_frame"],
-        "requested_video_ratio": winner["requested_video_ratio"],
-        "actual_sampled_frame_ratio": winner.get("actual_sampled_frame_ratio"),
-        "actual_frame_span_ratio": winner.get("actual_frame_span_ratio"),
-        "sam3_mask_track_metrics": winner["mask_track_metrics"],
-        "reason_selected": (
-            "Highest global dense-window score from complete-anchor coverage, "
-            "SAM3 mask area, continuity, scale, stability, and verified-anchor "
-            "consistency."
+    result["final_segmentation"] = {
+        "schema_version": FINAL_SEGMENTATION_SCHEMA_VERSION,
+        "role": "visualization_only",
+        "changes_temporal_selection": False,
+        "object_identity": identity,
+        "selected_window_id": selection["window_id"],
+        "requested_frame_count": len(display_ids),
+        "segmented_frame_count": sum(
+            bool(item["target_present"]) for item in frame_results
         ),
+        "frame_results": frame_results,
     }
+    result["sam3_frame_evidence"] = frame_results
     return result
 
 
@@ -664,61 +400,37 @@ def process_case(
     predictor: Any,
     case_dir: Path,
     work_root: Path,
-    max_candidates: int,
-    minimum_score_margin: float,
 ) -> dict[str, Any]:
-    print(f"\n===== SAM3 {case_dir.name} =====", flush=True)
+    print(f"\n===== SAM3 final masks {case_dir.name} =====", flush=True)
     work_case = work_root / case_dir.name
     result_path = case_dir / "temporal_analysis_result.json"
     result = temporal.read_json(result_path)
-    index = temporal.read_json(case_dir / "temporal_window_index.json")
-    catalog = temporal.make_frame_catalog(case_dir, index, work_case)
-    identity_name = str(
-        result.get("source_identity", {}).get("object_identity")
-        or result.get("target_object", "object")
+    temporal_index = temporal.read_json(case_dir / "temporal_window_index.json")
+    catalog = temporal.make_frame_catalog(case_dir, temporal_index, work_case)
+    result = finalize_result(
+        predictor, case_dir, work_case, result, temporal_index, catalog
     )
-    candidates = [
-        {**item, "sam_prompt_text": identity_name}
-        for item in result.get("sam3_rerank_candidates", [])[:max_candidates]
-        if item.get("seed_frame_id") is not None
-        and item.get("seed_bbox_xyxy_normalized")
-    ]
-    tracks = []
-    for position, candidate in enumerate(candidates, start=1):
-        print(
-            f"[track {position}/{len(candidates)}] {candidate['window_id']}",
-            flush=True,
-        )
-        tracks.append(
-            track_candidate(
-                predictor,
-                candidate,
-                catalog,
-                work_case / "sam3_tracks",
-            )
-        )
-    result = update_result(case_dir, result, tracks, minimum_score_margin)
     temporal.write_json(result_path, result)
     evidence = temporal.read_json(work_case / "qwen_frame_evidence.json")
-    temporal.render_result(case_dir, work_case, result, evidence, catalog, index)
+    temporal.render_result(
+        case_dir, work_case, result, evidence, catalog, temporal_index
+    )
     best = result.get("best_segment")
     return {
         "case_id": case_dir.name,
         "status": result["status"],
+        "pipeline_status": result.get("pipeline_status"),
         "window_id": best["window_id"] if best else None,
         "start_frame": best["start_frame"] if best else None,
         "end_frame": best["end_frame"] if best else None,
-        "uncertainty": result.get("uncertainty", ""),
-        "pipeline_status": result.get("pipeline_status"),
+        "segmented_frame_count": result.get("final_segmentation", {}).get(
+            "segmented_frame_count", 0
+        ),
     }
 
 
 def main() -> None:
     args = parse_args()
-    if args.max_candidates <= 0:
-        raise SystemExit("--max-candidates must be positive")
-    if args.minimum_score_margin < 0.0:
-        raise SystemExit("--minimum-score-margin cannot be negative")
     root = args.assets_root.resolve()
     work_root = args.work_dir.resolve()
     cases = temporal.case_directories(root, args.case)
@@ -737,7 +449,6 @@ def main() -> None:
 
     if str(REPOSITORY_ROOT) not in sys.path:
         sys.path.insert(0, str(REPOSITORY_ROOT))
-
     import torch
     from sam3.model_builder import build_sam3_video_predictor
 
@@ -745,25 +456,14 @@ def main() -> None:
     predictor = build_sam3_video_predictor(
         checkpoint_path=checkpoint,
         gpus_to_use=[torch.cuda.current_device()],
-        # Dense candidates can contain fewer than the default 15-frame
-        # detector hot-start. Explicit visual-box tracking must not be hidden
-        # by semantic-detection confirmation heuristics.
-        apply_temporal_disambiguation=APPLY_TEMPORAL_DISAMBIGUATION,
+        apply_temporal_disambiguation=False,
         compile=False,
     )
     summaries = []
     try:
         for case_dir in cases:
             try:
-                summaries.append(
-                    process_case(
-                        predictor,
-                        case_dir,
-                        work_root,
-                        args.max_candidates,
-                        args.minimum_score_margin,
-                    )
-                )
+                summaries.append(process_case(predictor, case_dir, work_root))
             except Exception as error:
                 traceback.print_exc()
                 summaries.append(
@@ -775,10 +475,11 @@ def main() -> None:
                 )
     finally:
         predictor.shutdown()
+
     summary_path = (
         args.summary_path.resolve()
         if args.summary_path
-        else root / "batch_sam3_temporal_summary.json"
+        else root / "batch_sam3_final_segmentation_summary.json"
     )
     temporal.write_json(summary_path, summaries)
     if args.summary_path is None:

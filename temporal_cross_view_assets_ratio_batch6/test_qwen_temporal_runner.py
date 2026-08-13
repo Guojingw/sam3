@@ -108,6 +108,10 @@ class TemporalSelectionTests(unittest.TestCase):
         )
         self.assertEqual(result["status"], "success")
         best = result["best_segment"]
+        self.assertEqual(result["qwen_temporal_selection"], best)
+        self.assertEqual(
+            result["pipeline_status"], "awaiting_final_sam3_segmentation"
+        )
         self.assertLessEqual(best["start_frame"], 1200)
         self.assertGreaterEqual(best["end_frame"], 2400)
         self.assertEqual(
@@ -142,9 +146,10 @@ class TemporalSelectionTests(unittest.TestCase):
             self.verifications(evidence),
         )
         self.assertEqual(result["status"], "uncertain")
-        self.assertEqual(result["schema_version"], 12)
+        self.assertEqual(result["schema_version"], 13)
+        self.assertEqual(result["pipeline_status"], "complete")
         self.assertEqual(
-            result["pipeline_status"], "complete_no_sam3_candidates"
+            result["final_segmentation"]["role"], "visualization_only"
         )
         self.assertIsNone(result["best_segment"])
 

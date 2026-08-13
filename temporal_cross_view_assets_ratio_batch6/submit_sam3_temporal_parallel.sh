@@ -1,5 +1,5 @@
 #!/bin/bash
-# Submit one independent one-GPU SAM3 reranking job per temporal case.
+# Submit one independent final-visualization SAM3 job per selected case.
 
 set -euo pipefail
 
@@ -24,10 +24,11 @@ for case_dir in "$ASSETS"/*__*; do
   result_path="$case_dir/temporal_analysis_result.json"
   if ! jq -e '
       .schema_version == 11 and
-      .pipeline_status == "awaiting_sam3_rerank" and
-      ((.sam3_rerank_candidates // []) | length) > 0
+      .pipeline_status == "awaiting_final_sam3_segmentation" and
+      .status == "success" and
+      .best_segment != null
     ' "$result_path" >/dev/null 2>&1; then
-    echo "Skipping $case_id: no pending schema-11 SAM3 candidates."
+    echo "Skipping $case_id: no selected window awaiting final masks."
     continue
   fi
   index=$((index + 1))
@@ -42,8 +43,8 @@ for case_dir in "$ASSETS"/*__*; do
 done
 
 if [[ $index -eq 0 ]]; then
-  echo "No schema-11 cases require SAM3 reranking."
+  echo "No selected schema-11 cases require final SAM3 masks."
   exit 0
 fi
 
-echo "Submitted $index independent SAM3 jobs."
+echo "Submitted $index independent final-mask jobs."

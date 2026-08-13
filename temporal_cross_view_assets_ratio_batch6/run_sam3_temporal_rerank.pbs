@@ -3,7 +3,7 @@
 #PBS -q normal
 #PBS -l select=1:ncpus=8:ngpus=1:mem=64gb
 #PBS -l walltime=04:00:00
-#PBS -N sam3_temporal_rerank
+#PBS -N sam3_final_masks
 #PBS -j oe
 
 set -euo pipefail
@@ -30,9 +30,6 @@ if [[ -n "${CASE_FILTER:-}" ]]; then
 fi
 if [[ -n "${SAM3_CHECKPOINT:-}" ]]; then
   ARGS+=(--checkpoint "$SAM3_CHECKPOINT")
-fi
-if [[ -n "${MAX_CANDIDATES:-}" ]]; then
-  ARGS+=(--max-candidates "$MAX_CANDIDATES")
 fi
 if [[ -n "${SUMMARY_PATH:-}" ]]; then
   ARGS+=(--summary-path "$SUMMARY_PATH")

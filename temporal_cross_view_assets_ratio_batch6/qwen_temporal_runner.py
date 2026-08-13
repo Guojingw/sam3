@@ -24,7 +24,7 @@ CASE_GLOB = "*__*"
 EVIDENCE_SCHEMA_VERSION = 5
 WINDOW_VERIFICATION_SCHEMA_VERSION = 8
 RESULT_SCHEMA_VERSION = 11
-FINAL_RESULT_SCHEMA_VERSION = 12
+FINAL_RESULT_SCHEMA_VERSION = 13
 CONFIRMED_THRESHOLD = 0.50
 POSSIBLE_THRESHOLD = 0.45
 WINDOW_SUPPORT_FRACTION = 0.60
@@ -2206,23 +2206,14 @@ def analyze_windows(
                 + 0.20 * verification_identity
             )
         score["selection_score"] = (
-            0.10 * verification_frame_fraction
-            + 0.20 * verification_identity
-            + 0.15 * score["captured_occurrence_fraction"]
-            + 0.20 * score["mean_presentation_quality"]
-            + 0.20 * score["mean_target_scale_score"]
-            + 0.05 * score["bbox_temporal_stability"]
-            + 0.05 * score["real_probe_support_fraction"]
-            + 0.05 * score["source_frame_temporal_prior"]
-        )
-        # Qwen presentation estimates are useful diagnostics, but they must not
-        # decide which windows reach the mask-tracking stage.
-        score["sam3_shortlist_score"] = (
             0.25 * verification_frame_fraction
-            + 0.25 * verification_identity
+            + 0.20 * verification_identity
             + 0.25 * score["captured_occurrence_fraction"]
             + 0.15 * score["real_probe_support_fraction"]
-            + 0.10 * score["source_frame_temporal_prior"]
+            + 0.05 * score["source_frame_temporal_prior"]
+            + 0.05 * score["mean_object_completeness"]
+            + 0.03 * score["mean_bbox_tightness"]
+            + 0.02 * score["mean_target_scale_score"]
         )
         score["valid"] = bool(
             window.get("continuity_ok")
@@ -2236,7 +2227,7 @@ def analyze_windows(
 
     candidates.sort(
         key=lambda entry: (
-            entry[2]["sam3_shortlist_score"],
+            entry[2]["selection_score"],
             entry[2]["captured_real_supported_count"],
             entry[2]["captured_supported_count"],
             entry[2]["source_frame_temporal_prior"],
@@ -2349,19 +2340,22 @@ def analyze_windows(
             "occurrence_qwen_verification_required": True,
         },
         "selection_algorithm": {
-            "name": "dense_sliding_windows_then_sam3_mask_rerank",
+            "name": "qwen_dense_sliding_window_selection",
             "source_frame_is_weak_prior": True,
             "window_ratios": [0.20, 0.25, 0.30],
             "candidate_comparison": (
-                "every sampled-frame start, CPU scoring, temporal NMS, strict "
-                "Qwen identity verification, then SAM3 mask reranking"
+                "every sampled-frame start, CPU scoring, temporal NMS, and "
+                "strict Qwen identity verification"
             ),
             "ranking_weights": {
                 "independently_verified_frame_fraction": 0.25,
-                "window_identity_verification": 0.25,
+                "window_identity_verification": 0.20,
                 "captured_occurrence_fraction": 0.25,
                 "real_probe_support_fraction": 0.15,
-                "source_frame_temporal_prior": 0.10,
+                "source_frame_temporal_prior": 0.05,
+                "mean_object_completeness": 0.05,
+                "mean_bbox_tightness": 0.03,
+                "mean_target_scale_score": 0.02,
             },
         },
         "window_verifications": window_verifications,
@@ -2373,79 +2367,18 @@ def analyze_windows(
         "uncertainty": "",
         "confidence": 0.0,
         "global_challenger_comparison": None,
-        "sam3_rerank_candidates": [],
-        "pipeline_status": "awaiting_sam3_rerank",
+        "pipeline_status": "awaiting_final_sam3_segmentation",
     }
-    sam3_shortlist = sorted(
-        valid,
-        key=lambda entry: (
-            entry[2]["sam3_shortlist_score"],
-            entry[2]["captured_real_supported_count"],
-        ),
-        reverse=True,
-    )
-    for window_candidate, _, score_candidate in sam3_shortlist[:5]:
-        verification_candidate = score_candidate.get("window_verification") or {}
-        verified_frames = [
-            item
-            for item in verification_candidate.get("frame_results", [])
-            if item.get("target_present") and item.get("bbox_xyxy_normalized")
-        ]
-        seed = max(
-            verified_frames,
-            key=lambda item: (
-                float(item.get("identity_confidence", 0.0)),
-                float(item.get("bbox_tightness", 0.0)),
-            ),
-            default=None,
-        )
-        result["sam3_rerank_candidates"].append(
-            {
-                "window_id": window_candidate["window_id"],
-                "cam": window_candidate["cam"],
-                "start_frame": window_candidate["start_frame"],
-                "end_frame": window_candidate["end_frame"],
-                "requested_video_ratio": window_candidate[
-                    "requested_video_ratio"
-                ],
-                "actual_sampled_frame_ratio": window_candidate[
-                    "actual_sampled_frame_ratio"
-                ],
-                "actual_frame_span_ratio": window_candidate[
-                    "actual_frame_span_ratio"
-                ],
-                "frame_ids": window_candidate["frame_ids"],
-                "qwen_fast_score": round(
-                    float(score_candidate.get("sam3_shortlist_score", 0.0)), 6
-                ),
-                "seed_frame_id": seed["frame_id"] if seed else None,
-                "seed_bbox_xyxy_normalized": (
-                    seed["bbox_xyxy_normalized"] if seed else None
-                ),
-                "verified_seed_frames": [
-                    {
-                        "frame_id": item["frame_id"],
-                        "bbox_xyxy_normalized": item[
-                            "bbox_xyxy_normalized"
-                        ],
-                    }
-                    for item in verified_frames
-                ],
-            }
-        )
     if not selected:
         result["schema_version"] = FINAL_RESULT_SCHEMA_VERSION
-        result["pipeline_status"] = "complete_no_sam3_candidates"
-        result["sam3_rerank"] = {
+        result["pipeline_status"] = "complete"
+        result["final_segmentation"] = {
             "schema_version": 1,
-            "candidate_count": 0,
-            "candidates": [],
+            "role": "visualization_only",
+            "changes_temporal_selection": False,
             "selected_window_id": None,
-            "score_margin": None,
-            "acceptance_gate": {
-                "passed": False,
-                "failed_conditions": ["no identity-verified dense windows"],
-            },
+            "frame_results": [],
+            "warning": "No Qwen-selected temporal window exists to segment.",
         }
         result["uncertainty"] = (
             "No dense 20%-30% continuous window contains at least two "
@@ -2572,14 +2505,15 @@ def analyze_windows(
         },
         "confidence": round(score["overall"], 4),
         "reason_selected": (
-            "Provisional Qwen shortlist leader among dense continuous 20%-30% "
-            "windows; SAM3 mask reranking is still required."
+            "Highest-scoring identity-verified dense continuous 20%-30% Qwen "
+            "window. SAM3 is used only for final visualization."
         ),
         "recommended_sam_prompt": (
             f"Segment the {identity.get('object_identity', metadata['target_object'])} "
             "matching the source masked RGB anchor."
         ),
     }
+    result["qwen_temporal_selection"] = dict(result["best_segment"])
     for window_alt, _, score_alt in valid[1:3]:
         result["alternative_segments"].append(
             {
@@ -2729,7 +2663,16 @@ def render_selected_contact_sheet(
     }
     window = windows[str(best["window_id"])]
     if "contact_sheet" not in window:
-        items = window_display_items(window, evidence_map)
+        items = selected_mask_display_items(
+            window,
+            evidence_map,
+            [
+                int(item["frame_id"])
+                for item in (result.get("final_segmentation") or {}).get(
+                    "frame_results", []
+                )
+            ],
+        )
         canvas = Image.new("RGB", (2500, 380), (246, 243, 234))
         draw = ImageDraw.Draw(canvas)
         draw.text(
@@ -2894,6 +2837,29 @@ def window_display_items(
     ]
 
 
+def selected_mask_display_items(
+    window: Mapping[str, Any],
+    evidence_map: Mapping[tuple[str, int], Mapping[str, Any]],
+    preferred_frame_ids: Sequence[int] | None = None,
+    count: int = 5,
+) -> list[Mapping[str, Any]]:
+    """Prefer the exact final SAM3 frames in the selected-window row."""
+    window_ids = {int(frame_id) for frame_id in window["frame_ids"]}
+    preferred = [
+        evidence_map[(str(window["cam"]), int(frame_id))]
+        for frame_id in (preferred_frame_ids or [])
+        if int(frame_id) in window_ids
+    ]
+    if preferred:
+        return preferred[:count]
+    masked = [
+        evidence_map[(str(window["cam"]), int(frame_id))]
+        for frame_id in window["frame_ids"]
+        if evidence_map[(str(window["cam"]), int(frame_id))].get("mask_path")
+    ]
+    return masked[:count] or window_display_items(window, evidence_map, count)
+
+
 def render_result(
     case_dir: Path,
     work_case: Path,
@@ -2908,6 +2874,14 @@ def render_result(
     evidence_map = verified_render_evidence(
         evidence, result.get("window_verifications", {})
     )
+    final_segmentation = result.get("final_segmentation") or {}
+    final_masks_only = final_segmentation.get("role") == "visualization_only"
+    if final_masks_only:
+        # Final analysis output must not expose Qwen's approximate localization.
+        # Only pixel masks produced for the selected display frames are drawn.
+        for evidence_item in evidence_map.values():
+            evidence_item["bbox_xyxy_normalized"] = None
+            evidence_item["mask_path"] = None
     sam3_candidate_frames = [
         (candidate.get("cam"), item)
         for candidate in reversed(
@@ -2917,9 +2891,9 @@ def render_result(
     ]
     selected_cam = str(best.get("cam")) if best else None
     selected_sam3 = {
-        (selected_cam, int(item["frame_id"])): item
+        (str(item.get("cam") or selected_cam), int(item["frame_id"])): item
         for item in result.get("sam3_frame_evidence", [])
-        if selected_cam
+        if item.get("target_present") and (item.get("cam") or selected_cam)
     }
     for cam, item in sam3_candidate_frames:
         if not cam or not item.get("target_present"):
@@ -2939,6 +2913,25 @@ def render_result(
                 "visibility": 1.0,
                 "identity_confidence": 1.0,
                 "evidence_score": 1.0,
+                "inference_kind": "sam3-mask",
+                "mask_path": selected_item.get("mask_path"),
+            }
+        )
+    for key, selected_item in selected_sam3.items():
+        if key not in evidence_map:
+            continue
+        evidence_map[key].update(
+            {
+                "model_presence": "confirmed",
+                "target_present": True,
+                "bbox_xyxy_normalized": None,
+                "visibility": 1.0,
+                "identity_confidence": float(
+                    selected_item.get("semantic_probability", 0.0)
+                ),
+                "evidence_score": float(
+                    selected_item.get("selection_score", 0.0)
+                ),
                 "inference_kind": "sam3-mask",
                 "mask_path": selected_item.get("mask_path"),
             }
@@ -2966,7 +2959,14 @@ def render_result(
     selected_window: Mapping[str, Any] | None = None
     if best:
         selected_window = windows_by_id[str(best["window_id"])]
-        selected_items = window_display_items(selected_window, evidence_map)
+        selected_items = selected_mask_display_items(
+            selected_window,
+            evidence_map,
+            [
+                int(item["frame_id"])
+                for item in final_segmentation.get("frame_results", [])
+            ],
+        )
     else:
         selected_items = timeline_bin_samples(evidence, 5, highest=True)
 
@@ -3011,7 +3011,8 @@ def render_result(
     if selected_window is not None:
         selected_label = (
             f"SELECTED | {selected_window['window_id']} | frames "
-            f"{selected_window['start_frame']}-{selected_window['end_frame']}"
+            f"{selected_window['start_frame']}-{selected_window['end_frame']} | "
+            f"object: {result['source_identity'].get('object_identity')}"
         )
     else:
         selected_label = "SELECTED | NONE | uncertain"
@@ -3033,7 +3034,14 @@ def render_result(
     draw.text((610, 570), comparison_label, font=heading_font, fill=(20, 27, 31))
     for index, item in enumerate(comparison[:5]):
         path = catalog[(item["cam"], int(item["frame_id"]))]
-        panel = draw_frame_panel(path, item, panel_size)
+        comparison_item = item
+        if final_masks_only:
+            comparison_item = {
+                **item,
+                "bbox_xyxy_normalized": None,
+                "mask_path": None,
+            }
+        panel = draw_frame_panel(path, comparison_item, panel_size)
         canvas.paste(panel, (610 + index * 505, 625))
 
     output = output_dir / "selected_vs_rejected_region_comparison.jpg"
@@ -3247,7 +3255,7 @@ def process_case(
         "end_frame": best["end_frame"] if best else None,
         "occurrence_spans": result.get("occurrence_spans", []),
         "confidence": result["confidence"],
-        "rendered_box_check": "pending_human_review",
+        "rendered_mask_check": "pending_human_review",
         "uncertainty": result.get("uncertainty", ""),
     }
 
