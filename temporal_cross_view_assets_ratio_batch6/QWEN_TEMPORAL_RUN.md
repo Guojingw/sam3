@@ -99,6 +99,9 @@ bash submit_sam3_temporal_parallel.sh "$EASY6" "$WORK"
 qstat -u "$USER"
 ```
 
+The submitter skips schema-11 cases with no valid SAM3 candidates, so those
+already-final `uncertain` cases do not consume another GPU allocation.
+
 The `g1` queue may limit how many jobs one user can run concurrently. Jobs in
 state `Q` remain queued and start automatically as running jobs finish.
 

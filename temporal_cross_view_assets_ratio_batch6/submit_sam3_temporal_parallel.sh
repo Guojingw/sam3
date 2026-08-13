@@ -21,6 +21,15 @@ for case_dir in "$ASSETS"/*__*; do
   [[ -f "$case_dir/metadata.json" ]] || continue
   [[ -f "$case_dir/temporal_window_index.json" ]] || continue
   case_id="$(basename "$case_dir")"
+  result_path="$case_dir/temporal_analysis_result.json"
+  if ! jq -e '
+      .schema_version == 11 and
+      .pipeline_status == "awaiting_sam3_rerank" and
+      ((.sam3_rerank_candidates // []) | length) > 0
+    ' "$result_path" >/dev/null 2>&1; then
+    echo "Skipping $case_id: no schema-11 SAM3 candidates."
+    continue
+  fi
   index=$((index + 1))
   summary_path="$SUMMARY_DIR/$case_id.json"
   job_id="$(
@@ -33,8 +42,8 @@ for case_dir in "$ASSETS"/*__*; do
 done
 
 if [[ $index -eq 0 ]]; then
-  echo "No case directories found under $ASSETS" >&2
-  exit 1
+  echo "No schema-11 cases require SAM3 reranking."
+  exit 0
 fi
 
 echo "Submitted $index independent SAM3 jobs."
