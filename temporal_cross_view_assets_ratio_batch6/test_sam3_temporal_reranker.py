@@ -258,6 +258,28 @@ class Sam3RerankerTests(unittest.TestCase):
             with Image.open(output / "000000.jpg") as image:
                 self.assertEqual(image.size, (32, 24))
 
+    def test_mask_overlay_changes_only_mask_pixels_and_hides_bbox(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            frame = root / "frame.png"
+            mask_path = root / "mask.png"
+            Image.new("RGB", (100, 100), (100, 100, 100)).save(frame)
+            mask = np.zeros((100, 100), dtype=np.uint8)
+            mask[50:80, 50:80] = 255
+            Image.fromarray(mask).save(mask_path)
+            panel = temporal.draw_frame_panel(
+                frame,
+                {
+                    "frame_id": 42,
+                    "inference_kind": "sam3-mask",
+                    "mask_path": str(mask_path),
+                    "bbox_xyxy_normalized": [0.1, 0.4, 0.9, 0.9],
+                },
+                (100, 100),
+            )
+            self.assertEqual(panel.getpixel((10, 40)), (100, 100, 100))
+            self.assertNotEqual(panel.getpixel((60, 60)), (100, 100, 100))
+
     def test_schema12_renderer_uses_dense_window_and_mask_box(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

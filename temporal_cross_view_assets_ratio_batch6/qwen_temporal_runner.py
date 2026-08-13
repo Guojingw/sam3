@@ -2629,17 +2629,23 @@ def draw_frame_panel(
     image_y = (size[1] - fitted.height) // 2
     panel = Image.new("RGB", size, (240, 240, 236))
     panel.paste(fitted, (image_x, image_y))
+    mask_rendered = False
     if evidence and evidence.get("mask_path"):
         mask_path = Path(str(evidence["mask_path"]))
         if mask_path.is_file():
             mask = Image.open(mask_path).convert("L").resize(
                 (fitted.width, fitted.height), Image.Resampling.NEAREST
             )
-            color = Image.new("RGB", fitted.size, (0, 230, 170))
-            alpha = mask.point(lambda value: round(value * 0.35))
+            color = Image.new("RGB", fitted.size, (0, 235, 175))
+            alpha = mask.point(lambda value: round(value * 0.52))
             panel.paste(color, (image_x, image_y), alpha)
+            mask_rendered = True
     draw = ImageDraw.Draw(panel)
-    if evidence and evidence.get("bbox_xyxy_normalized"):
+    if (
+        evidence
+        and evidence.get("bbox_xyxy_normalized")
+        and not mask_rendered
+    ):
         x1, y1, x2, y2 = evidence["bbox_xyxy_normalized"]
         box = (
             round(image_x + x1 * fitted.width),
@@ -2651,8 +2657,8 @@ def draw_frame_panel(
     frame_id = evidence.get("frame_id") if evidence else "?"
     inference_kind = evidence.get("inference_kind", "qwen") if evidence else "none"
     classification = (
-        "mask-tracked"
-        if inference_kind == "sam3-mask"
+        "mask overlay"
+        if mask_rendered
         else "verified"
         if inference_kind == "crop-verified"
         else "unverified"

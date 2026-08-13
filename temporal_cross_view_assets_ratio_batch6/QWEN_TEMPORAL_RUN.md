@@ -51,7 +51,9 @@ windows; SAM3 makes the final mask-based temporal decision.
     for the whole window. Otherwise emit `uncertain` instead of forcing a choice.
 11. Write schema-12 `temporal_analysis_result.json`, rerender the enlarged
     source/selected/alternative comparison, save representative masks for both
-    accepted and uncertain candidates, and update the batch summary.
+    accepted and uncertain candidates, and update the batch summary. Final SAM3
+    panels use a semi-transparent color only on mask pixels and suppress the
+    rectangular bbox; pixels outside the mask remain unchanged.
 
 The synchronized source frame is a search origin, not a hard target frame. The
 final segment is always continuous and occupies 20%-30% of its camera timeline.
