@@ -142,6 +142,10 @@ class TemporalSelectionTests(unittest.TestCase):
             self.verifications(evidence),
         )
         self.assertEqual(result["status"], "uncertain")
+        self.assertEqual(result["schema_version"], 12)
+        self.assertEqual(
+            result["pipeline_status"], "complete_no_sam3_candidates"
+        )
         self.assertIsNone(result["best_segment"])
 
     def test_presence_requires_bbox(self) -> None:

@@ -99,8 +99,9 @@ bash submit_sam3_temporal_parallel.sh "$EASY6" "$WORK"
 qstat -u "$USER"
 ```
 
-The submitter skips schema-11 cases with no valid SAM3 candidates, so those
-already-final `uncertain` cases do not consume another GPU allocation.
+Cases with no valid Qwen candidate are already finalized as schema-12
+`uncertain`. The submitter skips them, so they do not consume another GPU
+allocation.
 
 The `g1` queue may limit how many jobs one user can run concurrently. Jobs in
 state `Q` remain queued and start automatically as running jobs finish.
@@ -117,8 +118,10 @@ PYTHON="$HOME/.conda/envs/sam3/bin/python"
   --render-only
 ```
 
-The final result must be schema 12 with `pipeline_status=complete`. Schema 11
-is only the Qwen candidate stage and must not be treated as the final answer:
+The final result must be schema 12. A selected result uses
+`pipeline_status=complete`; a case with no valid Qwen candidate uses
+`pipeline_status=complete_no_sam3_candidates`. Schema 11 is only the Qwen
+candidate stage and must not be treated as the final answer:
 
 ```bash
 for f in "$EASY6"/*/temporal_analysis_result.json; do

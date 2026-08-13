@@ -27,7 +27,7 @@ for case_dir in "$ASSETS"/*__*; do
       .pipeline_status == "awaiting_sam3_rerank" and
       ((.sam3_rerank_candidates // []) | length) > 0
     ' "$result_path" >/dev/null 2>&1; then
-    echo "Skipping $case_id: no schema-11 SAM3 candidates."
+    echo "Skipping $case_id: no pending schema-11 SAM3 candidates."
     continue
   fi
   index=$((index + 1))

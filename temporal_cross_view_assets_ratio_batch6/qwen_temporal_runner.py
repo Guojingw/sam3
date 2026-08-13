@@ -24,6 +24,7 @@ CASE_GLOB = "*__*"
 EVIDENCE_SCHEMA_VERSION = 5
 WINDOW_VERIFICATION_SCHEMA_VERSION = 8
 RESULT_SCHEMA_VERSION = 11
+FINAL_RESULT_SCHEMA_VERSION = 12
 CONFIRMED_THRESHOLD = 0.50
 POSSIBLE_THRESHOLD = 0.45
 WINDOW_SUPPORT_FRACTION = 0.60
@@ -2433,7 +2434,19 @@ def analyze_windows(
             }
         )
     if not selected:
+        result["schema_version"] = FINAL_RESULT_SCHEMA_VERSION
         result["pipeline_status"] = "complete_no_sam3_candidates"
+        result["sam3_rerank"] = {
+            "schema_version": 1,
+            "candidate_count": 0,
+            "candidates": [],
+            "selected_window_id": None,
+            "score_margin": None,
+            "acceptance_gate": {
+                "passed": False,
+                "failed_conditions": ["no identity-verified dense windows"],
+            },
+        }
         result["uncertainty"] = (
             "No dense 20%-30% continuous window contains at least two "
             "localized scouts and two independently crop-verified identity matches."
