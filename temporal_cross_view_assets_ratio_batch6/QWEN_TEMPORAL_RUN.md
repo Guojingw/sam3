@@ -33,7 +33,9 @@ windows; SAM3 makes the final mask-based temporal decision.
    window, and derive every displayed bbox directly from that mask. When SAM3
    returns multiple object IDs, select the mask with maximum IoU to the seed
    box rather than the first ID. If that track fails, retry up to two additional
-   independently verified Qwen anchors from the same window.
+   independently verified Qwen anchors from the same window. Explicit box-seed
+   tracking disables SAM3's 15-frame semantic-detector hot-start because a
+   legal 20% candidate can contain fewer than 15 sampled frames.
 9. Rank SAM3 tracks by captured mask evidence, full-window coverage, longest
    continuous run, target scale, area stability, bbox motion stability, and IoU
    against at least two independently verified Qwen anchors.

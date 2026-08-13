@@ -20,6 +20,7 @@ import qwen_temporal_runner as temporal
 RERANK_SCHEMA_VERSION = 1
 RESULT_SCHEMA_VERSION = 12
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+APPLY_TEMPORAL_DISAMBIGUATION = False
 
 
 def parse_args() -> argparse.Namespace:
@@ -660,6 +661,10 @@ def main() -> None:
     predictor = build_sam3_video_predictor(
         checkpoint_path=checkpoint,
         gpus_to_use=[torch.cuda.current_device()],
+        # Dense candidates can contain fewer than the default 15-frame
+        # detector hot-start. Explicit visual-box tracking must not be hidden
+        # by semantic-detection confirmation heuristics.
+        apply_temporal_disambiguation=APPLY_TEMPORAL_DISAMBIGUATION,
         compile=False,
     )
     summaries = []

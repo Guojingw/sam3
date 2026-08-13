@@ -58,6 +58,9 @@ class Sam3RerankerTests(unittest.TestCase):
             (reranker.REPOSITORY_ROOT / "sam3" / "model_builder.py").is_file()
         )
 
+    def test_visual_box_tracking_disables_detector_hotstart(self) -> None:
+        self.assertFalse(reranker.APPLY_TEMPORAL_DISAMBIGUATION)
+
     def test_mask_bbox_uses_mask_pixels(self) -> None:
         mask = np.zeros((10, 20), dtype=bool)
         mask[2:8, 5:15] = True
