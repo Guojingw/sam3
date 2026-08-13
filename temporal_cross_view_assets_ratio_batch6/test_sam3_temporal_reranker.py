@@ -46,6 +46,8 @@ def track(window_id: str, evidence: float, coverage: float) -> dict:
             "verified_anchor_count": 2,
             "verified_anchor_match_count": 2,
             "prompt_mask_iou": 0.8,
+            "seed_anchor_coverage": 0.9,
+            "seed_mask_box_area_ratio": 1.1,
             "bbox_motion_stability": 0.95,
         },
         "_masks_by_frame": {0: mask, 300: mask, 600: mask},
@@ -66,6 +68,29 @@ class Sam3RerankerTests(unittest.TestCase):
         mask[2:8, 5:15] = True
         self.assertEqual(reranker.mask_bbox(mask), [0.25, 0.2, 0.75, 0.8])
 
+    def test_expand_box_is_centered_and_clamped(self) -> None:
+        for actual, expected in zip(
+            reranker.expand_box([0.2, 0.3, 0.4, 0.5], 2.0),
+            [0.1, 0.2, 0.5, 0.6],
+        ):
+            self.assertAlmostEqual(actual, expected)
+        for actual, expected in zip(
+            reranker.expand_box([0.0, 0.0, 0.2, 0.2], 2.0),
+            [0.0, 0.0, 0.3, 0.3],
+        ):
+            self.assertAlmostEqual(actual, expected)
+
+    def test_reference_coverage_rewards_full_anchor_coverage(self) -> None:
+        reference = [0.4, 0.4, 0.6, 0.6]
+        self.assertEqual(
+            reranker.box_reference_coverage([0.2, 0.2, 0.8, 0.8], reference),
+            1.0,
+        )
+        self.assertAlmostEqual(
+            reranker.box_reference_coverage([0.4, 0.4, 0.5, 0.5], reference),
+            0.25,
+        )
+
     def test_prompt_object_selection_does_not_take_first_object_id(self) -> None:
         wrong = np.zeros((20, 20), dtype=bool)
         wrong[1:3, 1:3] = True
@@ -81,6 +106,98 @@ class Sam3RerankerTests(unittest.TestCase):
         self.assertEqual(object_id, 20)
         self.assertTrue(np.array_equal(mask, target))
         self.assertGreater(overlap, 0.5)
+
+    def test_prompt_object_selection_prefers_complete_anchor_coverage(self) -> None:
+        partial = np.zeros((20, 20), dtype=bool)
+        partial[8:12, 8:12] = True
+        complete = np.zeros((20, 20), dtype=bool)
+        complete[5:17, 5:17] = True
+        object_id, mask, _ = reranker.prompt_aligned_output_mask(
+            {
+                "out_obj_ids": np.array([10, 20]),
+                "out_binary_masks": np.stack([partial, complete]),
+            },
+            [0.35, 0.35, 0.65, 0.65],
+        )
+        self.assertEqual(object_id, 20)
+        self.assertTrue(np.array_equal(mask, complete))
+
+    def test_partial_seed_mask_retries_expanded_semantic_prompt(self) -> None:
+        class FakePredictor:
+            def __init__(self) -> None:
+                self.add_requests = []
+                self.current_mask = None
+
+            def handle_request(self, request):
+                if request["type"] == "start_session":
+                    return {"session_id": "session"}
+                if request["type"] == "close_session":
+                    return {"is_success": True}
+                self.add_requests.append(request)
+                width = request["bounding_boxes"][0][2]
+                mask = np.zeros((20, 20), dtype=bool)
+                if width < 0.5:
+                    mask[8:12, 8:12] = True
+                else:
+                    mask[5:15, 5:15] = True
+                self.current_mask = mask
+                return {
+                    "outputs": {
+                        "out_obj_ids": np.array([7]),
+                        "out_binary_masks": np.stack([mask]),
+                    }
+                }
+
+            def handle_stream_request(self, request):
+                for frame_index in (0, 1):
+                    yield {
+                        "frame_index": frame_index,
+                        "outputs": {
+                            "out_obj_ids": np.array([7]),
+                            "out_binary_masks": np.stack([self.current_mask]),
+                        },
+                    }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            catalog = {}
+            for frame_id in (0, 1):
+                path = root / f"frame_{frame_id}.jpg"
+                Image.new("RGB", (40, 40), "white").save(path)
+                catalog[("cam01", frame_id)] = path
+            box = [0.3, 0.3, 0.7, 0.7]
+            candidate = {
+                "window_id": "window",
+                "cam": "cam01",
+                "start_frame": 0,
+                "end_frame": 1,
+                "requested_video_ratio": 0.2,
+                "actual_sampled_frame_ratio": 0.2,
+                "actual_frame_span_ratio": 0.2,
+                "frame_ids": [0, 1],
+                "seed_frame_id": 0,
+                "seed_bbox_xyxy_normalized": box,
+                "verified_seed_frames": [
+                    {"frame_id": 0, "bbox_xyxy_normalized": box},
+                    {"frame_id": 1, "bbox_xyxy_normalized": box},
+                ],
+                "sam_prompt_text": "CPR dummy",
+            }
+            predictor = FakePredictor()
+            tracked = reranker.track_candidate(
+                predictor, candidate, catalog, root / "tracks"
+            )
+            self.assertEqual(tracked["sam_prompt_scale"], 1.5)
+            self.assertEqual(len(predictor.add_requests), 2)
+            self.assertTrue(
+                all(
+                    request["text"] == "CPR dummy"
+                    for request in predictor.add_requests
+                )
+            )
+            self.assertEqual(
+                tracked["mask_track_metrics"]["seed_anchor_coverage"], 1.0
+            )
 
     def test_mask_score_prefers_continuous_captured_evidence(self) -> None:
         strong = track("strong", 2.0, 1.0)

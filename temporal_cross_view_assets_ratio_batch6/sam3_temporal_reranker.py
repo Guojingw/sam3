@@ -17,7 +17,7 @@ from PIL import Image
 import qwen_temporal_runner as temporal
 
 
-RERANK_SCHEMA_VERSION = 1
+RERANK_SCHEMA_VERSION = 2
 RESULT_SCHEMA_VERSION = 12
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 APPLY_TEMPORAL_DISAMBIGUATION = False
@@ -52,6 +52,30 @@ def box_iou(left: Sequence[float], right: Sequence[float]) -> float:
     left_area = temporal.normalized_box_area(left)
     right_area = temporal.normalized_box_area(right)
     return intersection / max(1e-9, left_area + right_area - intersection)
+
+
+def box_reference_coverage(
+    candidate: Sequence[float], reference: Sequence[float]
+) -> float:
+    intersection = max(
+        0.0, min(candidate[2], reference[2]) - max(candidate[0], reference[0])
+    ) * max(
+        0.0, min(candidate[3], reference[3]) - max(candidate[1], reference[1])
+    )
+    return intersection / max(1e-9, temporal.normalized_box_area(reference))
+
+
+def expand_box(box: Sequence[float], factor: float) -> list[float]:
+    center_x = (float(box[0]) + float(box[2])) / 2.0
+    center_y = (float(box[1]) + float(box[3])) / 2.0
+    half_width = (float(box[2]) - float(box[0])) * factor / 2.0
+    half_height = (float(box[3]) - float(box[1])) * factor / 2.0
+    return [
+        max(0.0, center_x - half_width),
+        max(0.0, center_y - half_height),
+        min(1.0, center_x + half_width),
+        min(1.0, center_y + half_height),
+    ]
 
 
 def mask_bbox(mask: np.ndarray) -> list[float] | None:
@@ -110,10 +134,19 @@ def prompt_aligned_output_mask(
         box = mask_bbox(mask)
         if box is None:
             continue
-        candidates.append((box_iou(box, prompt_box), int(object_id), mask))
+        candidates.append(
+            (
+                box_reference_coverage(box, prompt_box),
+                box_iou(box, prompt_box),
+                int(object_id),
+                mask,
+            )
+        )
     if not candidates:
         return None, None, 0.0
-    overlap, object_id, mask = max(candidates, key=lambda item: item[0])
+    _, overlap, object_id, mask = max(
+        candidates, key=lambda item: (item[0], item[1])
+    )
     return object_id, mask, float(overlap)
 
 
@@ -153,6 +186,8 @@ def track_candidate_once(
     track_root: Path,
     seed_frame_id: int,
     seed_box: Sequence[float],
+    prompt_box: Sequence[float],
+    prompt_scale: float,
 ) -> dict[str, Any]:
     window_id = str(candidate["window_id"])
     frame_ids = [int(value) for value in candidate["frame_ids"]]
@@ -170,15 +205,17 @@ def track_candidate_once(
     session_id = session["session_id"]
     masks_by_index: dict[int, np.ndarray] = {}
     try:
-        prompted = predictor.handle_request(
-            {
-                "type": "add_prompt",
-                "session_id": session_id,
-                "frame_index": seed_index,
-                "bounding_boxes": [box_xyxy_to_xywh(seed_box)],
-                "bounding_box_labels": [1],
-            }
-        )
+        prompt_request = {
+            "type": "add_prompt",
+            "session_id": session_id,
+            "frame_index": seed_index,
+            "bounding_boxes": [box_xyxy_to_xywh(prompt_box)],
+            "bounding_box_labels": [1],
+        }
+        prompt_text = str(candidate.get("sam_prompt_text", "")).strip()
+        if prompt_text:
+            prompt_request["text"] = prompt_text
+        prompted = predictor.handle_request(prompt_request)
         object_id, seed_mask, prompt_mask_iou = prompt_aligned_output_mask(
             prompted["outputs"], seed_box
         )
@@ -276,6 +313,18 @@ def track_candidate_once(
         else 0.0
     )
     raw_evidence = sum(areas)
+    seed_mask_box = mask_bbox(seed_mask) if seed_mask is not None else None
+    seed_anchor_coverage = (
+        box_reference_coverage(seed_mask_box, seed_box)
+        if seed_mask_box is not None
+        else 0.0
+    )
+    seed_box_area = temporal.normalized_box_area(seed_box)
+    seed_mask_box_area_ratio = (
+        temporal.normalized_box_area(seed_mask_box) / max(1e-9, seed_box_area)
+        if seed_mask_box is not None
+        else 0.0
+    )
     return {
         "rerank_schema_version": RERANK_SCHEMA_VERSION,
         "window_id": window_id,
@@ -287,6 +336,9 @@ def track_candidate_once(
         "actual_frame_span_ratio": candidate.get("actual_frame_span_ratio"),
         "seed_frame_id": seed_frame_id,
         "seed_bbox_xyxy_normalized": seed_box,
+        "sam_prompt_bbox_xyxy_normalized": list(prompt_box),
+        "sam_prompt_scale": prompt_scale,
+        "sam_prompt_text": candidate.get("sam_prompt_text"),
         "tracked_object_id": object_id,
         "frame_results": records,
         "mask_track_metrics": {
@@ -301,6 +353,8 @@ def track_candidate_once(
             "verified_anchor_count": len(verified_boxes),
             "verified_anchor_match_count": anchor_match_count,
             "prompt_mask_iou": prompt_mask_iou,
+            "seed_anchor_coverage": seed_anchor_coverage,
+            "seed_mask_box_area_ratio": seed_mask_box_area_ratio,
             "bbox_motion_stability": motion_stability,
         },
         "_masks_by_frame": masks_by_frame,
@@ -334,20 +388,33 @@ def track_candidate(
 
     trials = []
     for seed in unique_seeds:
-        trial = track_candidate_once(
-            predictor,
-            candidate,
-            catalog,
-            track_root,
-            int(seed["frame_id"]),
-            seed["bbox_xyxy_normalized"],
-        )
-        trials.append(trial)
-        metrics = trial["mask_track_metrics"]
-        if (
-            int(metrics["verified_anchor_match_count"]) >= 2
-            and float(metrics["prompt_mask_iou"]) >= 0.10
-            and int(metrics["present_frame_count"]) >= 2
+        seed_trials = []
+        for prompt_scale in (1.0, 1.5, 2.0):
+            trial = track_candidate_once(
+                predictor,
+                candidate,
+                catalog,
+                track_root,
+                int(seed["frame_id"]),
+                seed["bbox_xyxy_normalized"],
+                expand_box(seed["bbox_xyxy_normalized"], prompt_scale),
+                prompt_scale,
+            )
+            trials.append(trial)
+            seed_trials.append(trial)
+            metrics = trial["mask_track_metrics"]
+            if (
+                prompt_scale >= 1.5
+                and int(metrics["verified_anchor_match_count"]) >= 2
+                and float(metrics["seed_anchor_coverage"]) >= 0.75
+                and int(metrics["present_frame_count"]) >= 2
+            ):
+                break
+        if any(
+            int(trial["mask_track_metrics"]["verified_anchor_match_count"]) >= 2
+            and float(trial["mask_track_metrics"]["seed_anchor_coverage"]) >= 0.75
+            and int(trial["mask_track_metrics"]["present_frame_count"]) >= 2
+            for trial in seed_trials
         ):
             break
 
@@ -355,16 +422,22 @@ def track_candidate(
         trials,
         key=lambda item: (
             int(item["mask_track_metrics"]["verified_anchor_match_count"]),
-            float(item["mask_track_metrics"]["verified_anchor_iou"]),
-            float(item["mask_track_metrics"]["prompt_mask_iou"]),
+            float(item["mask_track_metrics"]["seed_anchor_coverage"]) >= 0.60,
             float(item["mask_track_metrics"]["longest_continuous_fraction"]),
             float(item["mask_track_metrics"]["coverage_fraction"]),
+            float(item["mask_track_metrics"]["seed_anchor_coverage"]),
+            float(item["mask_track_metrics"]["mean_mask_area_ratio"]),
+            float(item["mask_track_metrics"]["verified_anchor_iou"]),
         ),
     )
     winner["seed_trials"] = [
         {
             "seed_frame_id": trial["seed_frame_id"],
             "seed_bbox_xyxy_normalized": trial["seed_bbox_xyxy_normalized"],
+            "sam_prompt_bbox_xyxy_normalized": trial[
+                "sam_prompt_bbox_xyxy_normalized"
+            ],
+            "sam_prompt_scale": trial["sam_prompt_scale"],
             "metrics": trial["mask_track_metrics"],
             "selected_for_window": trial is winner,
         }
@@ -399,13 +472,14 @@ def score_tracks(tracks: list[dict[str, Any]]) -> None:
         metrics["normalized_captured_mask_evidence"] = captured
         metrics["normalized_target_scale"] = scale
         metrics["sam3_selection_score"] = (
-            0.25 * captured
+            0.20 * captured
             + 0.20 * float(metrics["coverage_fraction"])
             + 0.20 * float(metrics["longest_continuous_fraction"])
             + 0.15 * scale
             + 0.10 * float(metrics["verified_anchor_iou"])
-            + 0.05 * float(metrics["mask_area_stability"])
-            + 0.05 * float(metrics["bbox_motion_stability"])
+            + 0.10 * float(metrics["seed_anchor_coverage"])
+            + 0.025 * float(metrics["mask_area_stability"])
+            + 0.025 * float(metrics["bbox_motion_stability"])
         )
 
 
@@ -513,6 +587,7 @@ def update_result(
     accepted = bool(
         int(metrics["present_frame_count"]) >= 2
         and float(metrics["prompt_mask_iou"]) >= 0.10
+        and float(metrics["seed_anchor_coverage"]) >= 0.60
         and float(metrics["verified_anchor_iou"]) >= 0.10
         and int(metrics["verified_anchor_count"]) >= 2
         and int(metrics["verified_anchor_match_count"]) >= 2
@@ -523,6 +598,10 @@ def update_result(
         failed_gates.append("fewer than two tracked mask frames")
     if float(metrics["prompt_mask_iou"]) < 0.10:
         failed_gates.append("SAM3 prompt mask does not overlap its Qwen seed box")
+    if float(metrics["seed_anchor_coverage"]) < 0.60:
+        failed_gates.append(
+            "SAM3 mask covers less than 60% of its Qwen identity anchor"
+        )
     if int(metrics["verified_anchor_count"]) < 2:
         failed_gates.append("fewer than two independent Qwen anchors")
     if int(metrics["verified_anchor_match_count"]) < 2:
@@ -573,8 +652,9 @@ def update_result(
         "actual_frame_span_ratio": winner.get("actual_frame_span_ratio"),
         "sam3_mask_track_metrics": winner["mask_track_metrics"],
         "reason_selected": (
-            "Highest global dense-window score from SAM3 mask area, coverage, "
-            "continuity, scale, stability, and verified-anchor consistency."
+            "Highest global dense-window score from complete-anchor coverage, "
+            "SAM3 mask area, continuity, scale, stability, and verified-anchor "
+            "consistency."
         ),
     }
     return result
@@ -593,8 +673,12 @@ def process_case(
     result = temporal.read_json(result_path)
     index = temporal.read_json(case_dir / "temporal_window_index.json")
     catalog = temporal.make_frame_catalog(case_dir, index, work_case)
+    identity_name = str(
+        result.get("source_identity", {}).get("object_identity")
+        or result.get("target_object", "object")
+    )
     candidates = [
-        item
+        {**item, "sam_prompt_text": identity_name}
         for item in result.get("sam3_rerank_candidates", [])[:max_candidates]
         if item.get("seed_frame_id") is not None
         and item.get("seed_bbox_xyxy_normalized")

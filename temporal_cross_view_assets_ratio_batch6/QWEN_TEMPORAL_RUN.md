@@ -35,13 +35,20 @@ windows; SAM3 makes the final mask-based temporal decision.
    box rather than the first ID. If that track fails, retry up to two additional
    independently verified Qwen anchors from the same window. Explicit box-seed
    tracking disables SAM3's 15-frame semantic-detector hot-start because a
-   legal 20% candidate can contain fewer than 15 sampled frames.
+   legal 20% candidate can contain fewer than 15 sampled frames. If the seed
+   mask is found, always compare it with a centered 1.5x box; retry 2x when the
+   1.5x mask still covers less than 75% of the original identity box. All scales
+   also receive the source object identity text. The expanded box is only a
+   segmentation search region; the original Qwen box remains the identity
+   anchor.
 9. Rank SAM3 tracks by captured mask evidence, full-window coverage, longest
    continuous run, target scale, area stability, bbox motion stability, and IoU
    against at least two independently verified Qwen anchors.
 10. Select the highest-scoring legal continuous window only when it has two
-    anchor matches and beats the runner-up by the configured margin. Otherwise
-    emit `uncertain` instead of forcing a choice.
+    anchor matches, its seed mask covers at least 60% of the original identity
+    anchor, and it beats the runner-up by the configured margin. A temporally
+    stable partial-object mask therefore cannot pass solely because it tracks
+    for the whole window. Otherwise emit `uncertain` instead of forcing a choice.
 11. Write schema-12 `temporal_analysis_result.json`, rerender the enlarged
     source/selected/alternative comparison, save representative masks for both
     accepted and uncertain candidates, and update the batch summary.
