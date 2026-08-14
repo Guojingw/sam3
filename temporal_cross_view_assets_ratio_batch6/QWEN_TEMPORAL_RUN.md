@@ -56,6 +56,13 @@ WORK="$HOME/scratch/qwen35-4b/temporal_easy6_native_tiles_v3"
 cd "$HOME/worldmodel/sam3/temporal_cross_view_assets_ratio_batch6"
 ```
 
+Audit every case before submitting jobs. Legacy schema-2 results (including an
+old `yellow_tea_strainer_0` result) must return to Qwen before SAM3:
+
+```bash
+"$HOME/.conda/envs/sam3/bin/python" pipeline_audit.py --assets-root "$EASY6"
+```
+
 Run Qwen selection first. The existing parallel Qwen submission script can be
 used for all cases:
 
@@ -89,6 +96,32 @@ Submit SAM3 only after Qwen jobs finish:
 bash submit_sam3_temporal_parallel.sh "$EASY6" "$WORK"
 qstat -u "$USER"
 ```
+
+Run the audit again after each stage. `needs_qwen` must reach either
+`needs_sam3` or `complete_uncertain`; only `needs_sam3` is submitted to SAM3.
+`complete_uncertain` is a completed pipeline with no identity-verified window,
+not an execution failure, and must not be relabeled as a semantic success.
+
+## Selecting a replacement dataset case
+
+Use the dataset-wide quality scanner to replace an ambiguous item such as
+`white_mug_0`. It excludes cases already present in the assets directory and,
+by default, avoids names containing `mug` or `stainless`:
+
+```bash
+DATA="$HOME/scratch/datasets/Ego-Exo4D-Relation-Test/extracted/work/yuqian_fu/Ego/data_segswap_test"
+"$HOME/.conda/envs/sam3/bin/python" select_replacement_case.py \
+  --data-root "$DATA" \
+  --assets-root "$EASY6" \
+  --exclude-object white_mug_0 \
+  --exclude-take 0bacb5bb-591d-4756-a2cf-ed90793e65bb \
+  --top-k 10 \
+  --output "$WORK/replacement_candidates.json"
+```
+
+Inspect the top candidates' source overlays, then generate the chosen exact
+case with `generate_temporal_cross_view_assets.py --case-id <case_id>` rather
+than selecting by object name across every take.
 
 Each selected case now runs only five independent SAM3 frame segmentations, not
 multi-window video tracking. The job should therefore be much shorter than the

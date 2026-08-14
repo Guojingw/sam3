@@ -22,13 +22,19 @@ for case_dir in "$ASSETS"/*__*; do
   [[ -f "$case_dir/temporal_window_index.json" ]] || continue
   case_id="$(basename "$case_dir")"
   result_path="$case_dir/temporal_analysis_result.json"
+  if [[ ! -f "$result_path" ]]; then
+    echo "Skipping $case_id: missing Qwen result; run Qwen first."
+    continue
+  fi
   if ! jq -e '
       .schema_version == 11 and
       .pipeline_status == "awaiting_final_sam3_segmentation" and
       .status == "success" and
       .best_segment != null
     ' "$result_path" >/dev/null 2>&1; then
-    echo "Skipping $case_id: no selected window awaiting final masks."
+    schema="$(jq -r '.schema_version // 0' "$result_path" 2>/dev/null || echo 0)"
+    pipeline="$(jq -r '.pipeline_status // "legacy"' "$result_path" 2>/dev/null || echo unreadable)"
+    echo "Skipping $case_id: schema=$schema pipeline=$pipeline; run current Qwen first unless already complete."
     continue
   fi
   index=$((index + 1))
