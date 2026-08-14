@@ -13,7 +13,11 @@ The pipeline has two strictly separated stages.
    and 30% video lengths. This includes windows that cross old fixed boundaries.
 4. Qwen and deterministic scoring select the final continuous window. The result
    is saved in both `best_segment` and immutable `qwen_temporal_selection`.
-5. If Qwen has no valid identity-supported window, the result stays `uncertain`.
+5. A brief occurrence may be accepted from one independently crop-verified
+   frame when confidence is at least 0.90, at least two physical identity cues
+   match, and no cue conflicts. Code pads the chosen interval to a legal 20%
+   window.
+6. If Qwen has no valid identity-supported window, the result stays `uncertain`.
 
 SAM3 does not search time, rerank windows, reject a Qwen window, or change
 `success` to `uncertain`.
@@ -67,6 +71,16 @@ for f in "$EASY6"/*/temporal_analysis_result.json; do
   jq -r '[.case_id, .status, .pipeline_status,
           (.best_segment.window_id // "NONE")] | @tsv' "$f"
 done
+```
+
+When Qwen evidence and crop-verification caches already exist, apply updated
+window rules without loading Qwen or requesting a GPU:
+
+```bash
+"$HOME/.conda/envs/sam3/bin/python" qwen_temporal_runner.py \
+  --assets-root "$EASY6" \
+  --work-dir "$WORK" \
+  --rescore-only
 ```
 
 Submit SAM3 only after Qwen jobs finish:

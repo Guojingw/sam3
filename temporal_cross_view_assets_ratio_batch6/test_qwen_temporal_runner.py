@@ -80,6 +80,8 @@ class TemporalSelectionTests(unittest.TestCase):
                             "target_present": True,
                             "bbox_xyxy_normalized": [0.25, 0.25, 0.45, 0.55],
                             "identity_confidence": 0.9,
+                            "matched_visible_cues": ["shape", "material"],
+                            "conflicting_visible_cues": [],
                         }
                     ],
                     "representative_frame_id": representative["frame_id"],
@@ -136,7 +138,7 @@ class TemporalSelectionTests(unittest.TestCase):
             best["captured_occurrence"]["captured_occurrence_fraction"], 1.0
         )
 
-    def test_single_frame_glimpse_remains_uncertain(self) -> None:
+    def test_single_unverified_glimpse_remains_uncertain(self) -> None:
         evidence = synthetic_evidence(1200, 1200)
         result = runner.analyze_windows(
             self.metadata,
@@ -152,6 +154,52 @@ class TemporalSelectionTests(unittest.TestCase):
             result["final_segmentation"]["role"], "visualization_only"
         )
         self.assertIsNone(result["best_segment"])
+
+    def test_single_strong_crop_match_selects_padded_window(self) -> None:
+        evidence = synthetic_evidence(1200, 1200)
+        containing = next(
+            window
+            for window in runner.dense_sliding_windows(self.index)
+            if 1200 in window["frame_ids"]
+            and window["requested_video_ratio"] == 0.20
+        )
+        verification = {
+            "verification_schema_version": runner.WINDOW_VERIFICATION_SCHEMA_VERSION,
+            "verified_frame_ids": runner.representative_ids(
+                containing["frame_ids"], 5
+            ),
+            "frame_results": [
+                {
+                    "frame_id": 1200,
+                    "presence": "confirmed",
+                    "target_present": True,
+                    "localization_check_passed": True,
+                    "bbox_xyxy_normalized": [0.25, 0.25, 0.45, 0.55],
+                    "identity_confidence": 0.95,
+                    "matched_visible_cues": ["distinct shape", "matching material"],
+                    "conflicting_visible_cues": [],
+                    "presentation_quality": 0.8,
+                    "target_scale_score": 0.6,
+                    "estimated_target_frame_fraction": 0.05,
+                    "bbox_tightness": 0.8,
+                    "object_completeness": 0.9,
+                }
+            ],
+            "representative_frame_id": 1200,
+            "representative_bbox_xyxy_normalized": [0.25, 0.25, 0.45, 0.55],
+            "identity_confidence": 0.95,
+        }
+        result = runner.analyze_windows(
+            self.metadata,
+            self.index,
+            self.identity,
+            evidence,
+            {containing["window_id"]: verification},
+        )
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["best_segment"]["requested_video_ratio"], 0.20)
+        self.assertLessEqual(result["best_segment"]["start_frame"], 1200)
+        self.assertGreaterEqual(result["best_segment"]["end_frame"], 1200)
 
     def test_presence_requires_bbox(self) -> None:
         item = synthetic_evidence(1200, 1200)[40]
@@ -303,6 +351,8 @@ class TemporalSelectionTests(unittest.TestCase):
                         "target_present": True,
                         "bbox_xyxy_normalized": [0.1, 0.2, 0.3, 0.4],
                         "identity_confidence": 0.9,
+                        "matched_visible_cues": ["shape", "material"],
+                        "conflicting_visible_cues": [],
                     }
                 ],
             }
@@ -444,6 +494,8 @@ class TemporalSelectionTests(unittest.TestCase):
                         "localization_check_passed": True,
                         "bbox_xyxy_normalized": [0.2, 0.2, 0.5, 0.5],
                         "identity_confidence": 0.9,
+                        "matched_visible_cues": ["shape", "material"],
+                        "conflicting_visible_cues": [],
                         "presentation_quality": 0.9,
                         "target_scale_score": scale,
                         "estimated_target_frame_fraction": 0.08 * scale,

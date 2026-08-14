@@ -27,6 +27,7 @@ RESULT_SCHEMA_VERSION = 11
 FINAL_RESULT_SCHEMA_VERSION = 13
 CONFIRMED_THRESHOLD = 0.50
 POSSIBLE_THRESHOLD = 0.45
+STRONG_SINGLE_MATCH_CONFIDENCE = 0.90
 WINDOW_SUPPORT_FRACTION = 0.60
 WINDOW_CONFIRMED_FRACTION = 0.30
 MAX_INTERNAL_ABSENT_RUN = 4
@@ -57,6 +58,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--render-only", action="store_true")
+    parser.add_argument(
+        "--rescore-only",
+        action="store_true",
+        help=(
+            "Rebuild temporal results from cached identity, frame evidence, "
+            "and window verifications without loading Qwen."
+        ),
+    )
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--max-new-tokens", type=int, default=768)
     parser.add_argument(
@@ -1375,7 +1384,7 @@ def occurrence_runs(
     output = []
     for run in runs:
         positives = [item for item in run if is_supported(item)]
-        if len(positives) < 2:
+        if not positives:
             continue
         output.append(
             {
@@ -1689,7 +1698,7 @@ def occurrence_capture(
         ]
         fraction = len(captured) / max(1, len(run_items))
         candidate = {
-            "overlaps_occurrence": len(captured) >= 2,
+            "overlaps_occurrence": len(captured) >= 1,
             "occurrence_first_frame": run["first_confirmed_frame"],
             "occurrence_last_frame": run["last_confirmed_frame"],
             "occurrence_supported_count": len(run_items),
@@ -2076,6 +2085,14 @@ Return JSON only with exactly one entry per mapped frame:
             key=lambda item: float(item["identity_confidence"]),
             default=None,
         )
+        strong_positives = [
+            item
+            for item in positives
+            if float(item.get("identity_confidence", 0.0))
+            >= STRONG_SINGLE_MATCH_CONFIDENCE
+            and len(normalize_string_list(item.get("matched_visible_cues"))) >= 2
+            and not normalize_string_list(item.get("conflicting_visible_cues"))
+        ]
         thirds = max(1, len(target_frame_ids) // 3)
         cached[window_id] = {
             "verification_schema_version": WINDOW_VERIFICATION_SCHEMA_VERSION,
@@ -2092,8 +2109,9 @@ Return JSON only with exactly one entry per mapped frame:
             "target_in_end": any(
                 item["target_present"] for item in frame_results[-thirds:]
             ),
-            "contains_target_occurrence": len(positives) >= 2,
+            "contains_target_occurrence": bool(strong_positives),
             "visible_summary_position_count": len(positives),
+            "strong_identity_match_count": len(strong_positives),
             "first_visible_frame_id": (
                 positives[0]["frame_id"] if positives else None
             ),
@@ -2114,7 +2132,8 @@ Return JSON only with exactly one entry per mapped frame:
                 else 0.0
             ),
             "reason": (
-                f"Crop-verified identity matches: {len(positives)}/{len(frame_results)}."
+                f"Strong crop identity matches: {len(strong_positives)}; "
+                f"all accepted crop matches: {len(positives)}/{len(frame_results)}."
             ),
             "raw_full_frame_response": raw,
             "raw_candidate_crop_response": crop_raw,
@@ -2155,6 +2174,22 @@ def verification_presentation_scores(
     }
 
 
+def strong_crop_verified_frames(
+    verification: Mapping[str, Any] | None,
+) -> list[Mapping[str, Any]]:
+    """Return single-frame evidence strong enough for brief occurrences."""
+    return [
+        item
+        for item in (verification or {}).get("frame_results", [])
+        if item.get("target_present")
+        and item.get("bbox_xyxy_normalized")
+        and float(item.get("identity_confidence", 0.0))
+        >= STRONG_SINGLE_MATCH_CONFIDENCE
+        and len(normalize_string_list(item.get("matched_visible_cues"))) >= 2
+        and not normalize_string_list(item.get("conflicting_visible_cues"))
+    ]
+
+
 def analyze_windows(
     metadata: Mapping[str, Any],
     temporal_index: Mapping[str, Any],
@@ -2180,24 +2215,25 @@ def analyze_windows(
         capture = occurrence_capture(window, runs, evidence)
         score.update(capture)
         verification = window_verifications.get(str(window["window_id"]))
+        strong_verified = strong_crop_verified_frames(verification)
+        representative = max(
+            strong_verified,
+            key=lambda item: float(item.get("identity_confidence", 0.0)),
+            default=None,
+        )
         verification_ok = bool(
             verification
-            and verification.get("contains_target_occurrence")
-            and int(verification.get("visible_summary_position_count", 0)) >= 2
-            and verification.get("representative_frame_id")
-            in window["frame_ids"]
-            and verification.get("representative_bbox_xyxy_normalized")
-            and float(verification.get("identity_confidence", 0.0))
-            >= CONFIRMED_THRESHOLD
+            and representative
+            and int(representative["frame_id"]) in window["frame_ids"]
         )
         score["window_verification"] = verification
         score["window_verification_ok"] = verification_ok
         verification_identity = float(
             (verification or {}).get("identity_confidence", 0.0)
         )
-        verification_frame_fraction = int(
-            (verification or {}).get("visible_summary_position_count", 0)
-        ) / max(1, len((verification or {}).get("verified_frame_ids", [])))
+        verification_frame_fraction = len(strong_verified) / max(
+            1, len((verification or {}).get("verified_frame_ids", []))
+        )
         score["verification_frame_fraction"] = verification_frame_fraction
         score.update(verification_presentation_scores(verification))
         if verification:
@@ -2219,7 +2255,7 @@ def analyze_windows(
             window.get("continuity_ok")
             and 0.20 <= float(window["requested_video_ratio"]) <= 0.30
             and score["overlaps_occurrence"]
-            and score["captured_supported_count"] >= 2
+            and score["captured_supported_count"] >= 1
             and score["captured_confirmed_count"] >= 1
             and verification_ok
         )
@@ -2330,9 +2366,12 @@ def analyze_windows(
         "selection_constraints": {
             "window_ratio_min": 0.20,
             "window_ratio_max": 0.30,
-            "minimum_captured_supported_frames": 2,
+            "minimum_captured_supported_frames": 1,
             "minimum_captured_confirmed_frames": 1,
-            "minimum_crop_verified_identity_frames": 2,
+            "minimum_crop_verified_identity_frames": 1,
+            "single_frame_identity_confidence_min": (
+                STRONG_SINGLE_MATCH_CONFIDENCE
+            ),
             "minimum_visible_identity_cues_per_verified_crop": 2,
             "conflicting_identity_cues_allowed": False,
             "window_must_overlap_confirmed_occurrence": True,
@@ -2381,8 +2420,8 @@ def analyze_windows(
             "warning": "No Qwen-selected temporal window exists to segment.",
         }
         result["uncertainty"] = (
-            "No dense 20%-30% continuous window contains at least two "
-            "localized scouts and two independently crop-verified identity matches."
+            "No dense 20%-30% continuous window contains a confirmed localized "
+            "scout and an independently crop-verified strong identity match."
         )
         result["confidence"] = round(
             max((entry[2]["overall"] for entry in candidates), default=0.0), 4
@@ -2391,11 +2430,7 @@ def analyze_windows(
 
     window, items, score = selected
     verified_items = [
-        item
-        for item in (score["window_verification"] or {}).get(
-            "frame_results", []
-        )
-        if item.get("target_present")
+        item for item in strong_crop_verified_frames(score["window_verification"])
     ]
     verified_boxes = [
         item["bbox_xyxy_normalized"] for item in verified_items
@@ -3094,6 +3129,7 @@ def process_case(
     work_root: Path,
     qwen: Qwen | None,
     render_only: bool,
+    rescore_only: bool,
     force: bool,
     max_frame_probes_per_camera: int,
     probe_refinement_radius: int,
@@ -3116,6 +3152,23 @@ def process_case(
     if render_only:
         result = read_json(result_path)
         evidence = read_json(evidence_path)
+    elif rescore_only:
+        identity = read_json(identity_path)
+        evidence = read_json(evidence_path)
+        verification_path = work_case / "qwen_window_verifications.json"
+        window_verifications = read_json(verification_path)
+        previous = read_json(result_path) if result_path.exists() else {}
+        result = analyze_windows(
+            anchor["metadata"],
+            temporal_index,
+            identity,
+            evidence,
+            window_verifications,
+        )
+        for key in ("probe_statistics", "input_frame_statistics"):
+            if key in previous:
+                result[key] = previous[key]
+        write_json(result_path, result)
     else:
         if qwen is None:
             raise RuntimeError("Qwen is required for analysis")
@@ -3262,6 +3315,8 @@ def process_case(
 
 def main() -> None:
     args = parse_args()
+    if args.render_only and args.rescore_only:
+        raise SystemExit("--render-only and --rescore-only are mutually exclusive")
     if args.max_frame_probes_per_camera <= 0:
         raise SystemExit("--max-frame-probes-per-camera must be positive")
     if args.probe_refinement_radius <= 0:
@@ -3275,7 +3330,11 @@ def main() -> None:
     cases = case_directories(root, args.case)
     if not cases:
         raise SystemExit("No case directories found")
-    qwen = None if args.render_only else Qwen(args.model, args.max_new_tokens)
+    qwen = (
+        None
+        if args.render_only or args.rescore_only
+        else Qwen(args.model, args.max_new_tokens)
+    )
     summaries = []
     for case_dir in cases:
         try:
@@ -3285,6 +3344,7 @@ def main() -> None:
                     work_root,
                     qwen,
                     args.render_only,
+                    args.rescore_only,
                     args.force,
                     args.max_frame_probes_per_camera,
                     args.probe_refinement_radius,
