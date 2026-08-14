@@ -105,8 +105,10 @@ not an execution failure, and must not be relabeled as a semantic success.
 ## Selecting a replacement dataset case
 
 Use the dataset-wide quality scanner to replace an ambiguous item such as
-`white_mug_0`. It excludes cases already present in the assets directory and,
-by default, avoids names containing `mug` or `stainless`:
+`white_mug_0`. It excludes every take already represented in the assets
+directory, returns at most one object per remaining take, and by default avoids
+names containing `mug` or `stainless`. This prevents a batch from silently
+becoming several objects from one scene:
 
 ```bash
 DATA="$HOME/scratch/datasets/Ego-Exo4D-Relation-Test/extracted/work/yuqian_fu/Ego/data_segswap_test"
@@ -115,13 +117,15 @@ DATA="$HOME/scratch/datasets/Ego-Exo4D-Relation-Test/extracted/work/yuqian_fu/Eg
   --assets-root "$EASY6" \
   --exclude-object white_mug_0 \
   --exclude-take 0bacb5bb-591d-4756-a2cf-ed90793e65bb \
-  --top-k 10 \
+  --top-k 6 \
   --output "$WORK/replacement_candidates.json"
 ```
 
-Inspect the top candidates' source overlays, then generate the chosen exact
-case with `generate_temporal_cross_view_assets.py --case-id <case_id>` rather
-than selecting by object name across every take.
+The six recommendations have six distinct `take_id` values. Inspect their
+source overlays, then generate each exact case with
+`generate_temporal_cross_view_assets.py --case-id <case_id>` rather than
+selecting by object name across every take. Pass `--allow-existing-takes` or
+`--allow-multiple-per-take` only when same-scene reuse is intentional.
 
 Each selected case now runs only five independent SAM3 frame segmentations, not
 multi-window video tracking. The job should therefore be much shorter than the

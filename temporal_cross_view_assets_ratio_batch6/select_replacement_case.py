@@ -17,6 +17,39 @@ sys.path.insert(0, str(REPO_ROOT))
 generator: Any = None
 
 
+def existing_take_ids(assets_root: Path | None) -> set[str]:
+    """Read take IDs already represented in an existing assets batch."""
+    take_ids: set[str] = set()
+    if not assets_root or not assets_root.is_dir():
+        return take_ids
+    for metadata_path in assets_root.glob("*__*/metadata.json"):
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        take_id = str(metadata.get("take_id", "")).strip()
+        if take_id:
+            take_ids.add(take_id)
+    return take_ids
+
+
+def diverse_recommendations(
+    rows: list[dict[str, Any]], limit: int, one_per_take: bool = True
+) -> list[dict[str, Any]]:
+    """Keep the highest-quality case from each take unless explicitly disabled."""
+    selected: list[dict[str, Any]] = []
+    seen_takes: set[str] = set()
+    for row in rows:
+        take_id = str(row["take_id"])
+        if one_per_take and take_id in seen_takes:
+            continue
+        selected.append(row)
+        seen_takes.add(take_id)
+        if len(selected) >= max(1, limit):
+            break
+    return selected
+
+
 def target_frame_count(take_dir: Path, prefix: str) -> int:
     return sum(
         len(generator.image_files(path))
@@ -73,6 +106,16 @@ def main() -> int:
     parser.add_argument("--exclude-object", action="append", default=[])
     parser.add_argument("--exclude-take", action="append", default=[])
     parser.add_argument(
+        "--allow-existing-takes",
+        action="store_true",
+        help="Do not exclude take IDs already represented by --assets-root.",
+    )
+    parser.add_argument(
+        "--allow-multiple-per-take",
+        action="store_true",
+        help="Allow more than one recommended object from the same scene/take.",
+    )
+    parser.add_argument(
         "--avoid-term",
         action="append",
         default=["mug", "stainless"],
@@ -97,6 +140,9 @@ def main() -> int:
         }
     excluded_objects = set(args.exclude_object)
     excluded_takes = set(args.exclude_take)
+    represented_takes = existing_take_ids(args.assets_root)
+    if not args.allow_existing_takes:
+        excluded_takes.update(represented_takes)
     avoid_terms = [term.lower() for term in args.avoid_term]
 
     rows = []
@@ -135,8 +181,18 @@ def main() -> int:
         ),
         reverse=True,
     )
-    output = rows[: max(1, args.top_k)]
-    payload = {"candidate_count": len(rows), "recommendations": output}
+    output = diverse_recommendations(
+        rows,
+        args.top_k,
+        one_per_take=not args.allow_multiple_per_take,
+    )
+    payload = {
+        "eligible_case_count": len(rows),
+        "eligible_take_count": len({row["take_id"] for row in rows}),
+        "excluded_existing_take_ids": sorted(represented_takes),
+        "one_recommendation_per_take": not args.allow_multiple_per_take,
+        "recommendations": output,
+    }
     rendered = json.dumps(payload, indent=2, ensure_ascii=False)
     print(rendered)
     if args.output:
