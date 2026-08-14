@@ -178,8 +178,13 @@ def main() -> int:
     parser.add_argument(
         "--avoid-term",
         action="append",
-        default=["mug", "stainless"],
+        default=[],
         help="Case-insensitive name fragment to exclude (repeatable).",
+    )
+    parser.add_argument(
+        "--no-default-avoid-terms",
+        action="store_true",
+        help="Include mug/stainless labels; exact exclusions still apply.",
     )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
@@ -203,7 +208,8 @@ def main() -> int:
     represented_takes = existing_take_ids(args.assets_root)
     if not args.allow_existing_takes:
         excluded_takes.update(represented_takes)
-    avoid_terms = [term.lower() for term in args.avoid_term]
+    avoid_terms = [] if args.no_default_avoid_terms else ["mug", "stainless"]
+    avoid_terms.extend(term.lower() for term in args.avoid_term)
 
     rows = []
     cases = generator.discover_cases(args.data_root, "annotation.json", [])

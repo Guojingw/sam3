@@ -129,7 +129,9 @@ Inspect their source overlays, then generate each exact case with
 `generate_temporal_cross_view_assets.py --case-id <case_id>` rather than
 selecting by object name across every take. Pass `--allow-existing-takes`,
 `--allow-multiple-per-take`, or `--allow-duplicate-objects` only when that reuse
-is intentional.
+is intentional. If the viable candidate pool is too small, pass
+`--no-default-avoid-terms` to admit mug/stainless labels from new takes while
+keeping explicit object/take exclusions and the target-window viability gate.
 
 Each selected case now runs only five independent SAM3 frame segmentations, not
 multi-window video tracking. The job should therefore be much shorter than the
