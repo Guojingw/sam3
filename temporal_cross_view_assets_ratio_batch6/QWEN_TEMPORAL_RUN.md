@@ -109,7 +109,9 @@ Use the dataset-wide quality scanner to replace an ambiguous item such as
 directory, returns at most one object per remaining take and one case per object
 label, and by default avoids names containing `mug` or `stainless`. This
 prevents a batch from silently becoming several objects from one scene or the
-same object repeated across scenes:
+same object repeated across scenes. A candidate must also have at least one
+target camera with a contiguous run long enough to form a 20% window; raw image
+count alone is not sufficient:
 
 ```bash
 DATA="$HOME/scratch/datasets/Ego-Exo4D-Relation-Test/extracted/work/yuqian_fu/Ego/data_segswap_test"

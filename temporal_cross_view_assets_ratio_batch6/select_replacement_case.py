@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import math
 import sys
 from pathlib import Path
 from statistics import median
@@ -58,12 +59,53 @@ def diverse_recommendations(
     return selected
 
 
-def target_frame_count(take_dir: Path, prefix: str) -> int:
-    return sum(
-        len(generator.image_files(path))
-        for path in take_dir.iterdir()
-        if path.is_dir() and path.name.startswith(prefix)
+def largest_contiguous_run(
+    frame_ids: list[int], max_gap_factor: float = 2.5
+) -> int:
+    if not frame_ids:
+        return 0
+    ordered = sorted(set(frame_ids))
+    gaps = [right - left for left, right in zip(ordered, ordered[1:])]
+    positive = sorted(gap for gap in gaps if gap > 0)
+    if not positive:
+        return 1
+    middle = len(positive) // 2
+    median_gap = (
+        float(positive[middle])
+        if len(positive) % 2
+        else (positive[middle - 1] + positive[middle]) / 2.0
     )
+    threshold = median_gap * max_gap_factor
+    longest = current = 1
+    for gap in gaps:
+        if gap <= threshold:
+            current += 1
+        else:
+            longest = max(longest, current)
+            current = 1
+    return max(longest, current)
+
+
+def target_frame_statistics(take_dir: Path, prefix: str) -> dict[str, Any]:
+    total = 0
+    largest_run = 0
+    viable_camera_count = 0
+    for path in take_dir.iterdir():
+        if not path.is_dir() or not path.name.startswith(prefix):
+            continue
+        frame_map, _ = generator.build_frame_map(path)
+        camera_count = len(frame_map)
+        camera_run = largest_contiguous_run(list(frame_map))
+        total += camera_count
+        largest_run = max(largest_run, camera_run)
+        minimum_window = max(2, math.floor(camera_count * 0.20))
+        if camera_run >= minimum_window:
+            viable_camera_count += 1
+    return {
+        "target_frame_count": total,
+        "largest_contiguous_target_run": largest_run,
+        "viable_target_camera_count": viable_camera_count,
+    }
 
 
 def score_case(
@@ -79,7 +121,8 @@ def score_case(
     if not valid:
         return None
     ratios = [float(item.mask_area_ratio) for item in valid]
-    target_frames = target_frame_count(case.take_dir, target_prefix)
+    target = target_frame_statistics(case.take_dir, target_prefix)
+    target_frames = int(target["target_frame_count"])
     # Favor a large, repeatedly visible source mask and a substantial target
     # timeline. This is a data-quality ranking, not a semantic success claim.
     quality = (
@@ -97,6 +140,10 @@ def score_case(
         "median_source_mask_ratio": round(median(ratios), 8),
         "valid_source_mask_frames": len(valid),
         "target_frame_count": target_frames,
+        "largest_contiguous_target_run": target[
+            "largest_contiguous_target_run"
+        ],
+        "viable_target_camera_count": target["viable_target_camera_count"],
         "warning_count": len(warnings),
     }
 
@@ -181,6 +228,8 @@ def main() -> int:
         if row["valid_source_mask_frames"] < args.min_source_frames:
             continue
         if row["target_frame_count"] < args.min_target_frames:
+            continue
+        if row["viable_target_camera_count"] < 1:
             continue
         rows.append(row)
         if position % 100 == 0:

@@ -14,6 +14,14 @@ import select_replacement_case as selector
 
 
 class ReplacementSelectionTests(unittest.TestCase):
+    def test_largest_contiguous_run_splits_large_frame_gaps(self) -> None:
+        self.assertEqual(
+            selector.largest_contiguous_run([0, 30, 60, 90, 900, 930]), 4
+        )
+
+    def test_largest_contiguous_run_handles_empty_input(self) -> None:
+        self.assertEqual(selector.largest_contiguous_run([]), 0)
+
     def test_existing_take_ids_are_read_from_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
