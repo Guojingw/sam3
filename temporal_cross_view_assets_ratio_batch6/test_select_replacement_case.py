@@ -26,21 +26,32 @@ class ReplacementSelectionTests(unittest.TestCase):
 
     def test_default_recommendations_use_distinct_takes(self) -> None:
         rows = [
-            {"case_id": "a__one", "take_id": "a", "quality_score": 0.9},
-            {"case_id": "a__two", "take_id": "a", "quality_score": 0.8},
-            {"case_id": "b__one", "take_id": "b", "quality_score": 0.7},
-            {"case_id": "c__one", "take_id": "c", "quality_score": 0.6},
+            {"case_id": "a__one", "take_id": "a", "object_name": "one", "quality_score": 0.9},
+            {"case_id": "a__two", "take_id": "a", "object_name": "two", "quality_score": 0.8},
+            {"case_id": "b__three", "take_id": "b", "object_name": "three", "quality_score": 0.7},
+            {"case_id": "c__four", "take_id": "c", "object_name": "four", "quality_score": 0.6},
         ]
         selected = selector.diverse_recommendations(rows, 3)
         self.assertEqual(
             [item["case_id"] for item in selected],
-            ["a__one", "b__one", "c__one"],
+            ["a__one", "b__three", "c__four"],
+        )
+
+    def test_default_recommendations_use_distinct_objects(self) -> None:
+        rows = [
+            {"case_id": "a__cup", "take_id": "a", "object_name": "cup"},
+            {"case_id": "b__cup", "take_id": "b", "object_name": "cup"},
+            {"case_id": "c__plate", "take_id": "c", "object_name": "plate"},
+        ]
+        selected = selector.diverse_recommendations(rows, 3)
+        self.assertEqual(
+            [item["case_id"] for item in selected], ["a__cup", "c__plate"]
         )
 
     def test_multiple_objects_per_take_requires_opt_in(self) -> None:
         rows = [
-            {"case_id": "a__one", "take_id": "a"},
-            {"case_id": "a__two", "take_id": "a"},
+            {"case_id": "a__one", "take_id": "a", "object_name": "one"},
+            {"case_id": "a__two", "take_id": "a", "object_name": "two"},
         ]
         selected = selector.diverse_recommendations(
             rows, 2, one_per_take=False

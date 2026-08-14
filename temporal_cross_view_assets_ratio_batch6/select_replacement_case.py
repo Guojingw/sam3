@@ -34,17 +34,25 @@ def existing_take_ids(assets_root: Path | None) -> set[str]:
 
 
 def diverse_recommendations(
-    rows: list[dict[str, Any]], limit: int, one_per_take: bool = True
+    rows: list[dict[str, Any]],
+    limit: int,
+    one_per_take: bool = True,
+    one_per_object: bool = True,
 ) -> list[dict[str, Any]]:
-    """Keep the highest-quality case from each take unless explicitly disabled."""
+    """Keep the best case per take and object unless explicitly disabled."""
     selected: list[dict[str, Any]] = []
     seen_takes: set[str] = set()
+    seen_objects: set[str] = set()
     for row in rows:
         take_id = str(row["take_id"])
+        object_name = str(row["object_name"])
         if one_per_take and take_id in seen_takes:
+            continue
+        if one_per_object and object_name in seen_objects:
             continue
         selected.append(row)
         seen_takes.add(take_id)
+        seen_objects.add(object_name)
         if len(selected) >= max(1, limit):
             break
     return selected
@@ -116,6 +124,11 @@ def main() -> int:
         help="Allow more than one recommended object from the same scene/take.",
     )
     parser.add_argument(
+        "--allow-duplicate-objects",
+        action="store_true",
+        help="Allow the same object label to be recommended in multiple takes.",
+    )
+    parser.add_argument(
         "--avoid-term",
         action="append",
         default=["mug", "stainless"],
@@ -185,12 +198,14 @@ def main() -> int:
         rows,
         args.top_k,
         one_per_take=not args.allow_multiple_per_take,
+        one_per_object=not args.allow_duplicate_objects,
     )
     payload = {
         "eligible_case_count": len(rows),
         "eligible_take_count": len({row["take_id"] for row in rows}),
         "excluded_existing_take_ids": sorted(represented_takes),
         "one_recommendation_per_take": not args.allow_multiple_per_take,
+        "one_recommendation_per_object": not args.allow_duplicate_objects,
         "recommendations": output,
     }
     rendered = json.dumps(payload, indent=2, ensure_ascii=False)
