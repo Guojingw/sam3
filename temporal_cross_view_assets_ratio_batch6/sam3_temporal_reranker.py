@@ -350,6 +350,9 @@ def finalize_result(
         result.get("source_identity", {}).get("object_identity")
         or result.get("target_object", "object")
     )
+    mask_output_dir = case_dir / "analysis_outputs" / "final_sam3_masks"
+    if mask_output_dir.exists():
+        shutil.rmtree(mask_output_dir)
     frame_results = []
     for position, frame_id in enumerate(display_ids, start=1):
         print(

@@ -205,6 +205,9 @@ class FinalSegmentationTests(unittest.TestCase):
     def test_final_segmentation_writes_five_independent_masks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             case, work, index, catalog, _, result = temporal_fixture(Path(tmp))
+            stale = case / "analysis_outputs" / "final_sam3_masks" / "stale.png"
+            stale.parent.mkdir(parents=True)
+            Image.new("L", (5, 5), 255).save(stale)
             predictor = FakePredictor()
             updated = segmenter.finalize_result(
                 predictor, case, work, result, index, catalog
@@ -217,6 +220,7 @@ class FinalSegmentationTests(unittest.TestCase):
             self.assertTrue(
                 all((case / item["mask_path"]).is_file() for item in frames)
             )
+            self.assertFalse(stale.exists())
 
     def test_mask_overlay_changes_only_mask_pixels_and_hides_bbox(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
