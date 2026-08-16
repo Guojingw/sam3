@@ -132,6 +132,8 @@ selecting by object name across every take. Pass `--allow-existing-takes`,
 is intentional. If the viable candidate pool is too small, pass
 `--no-default-avoid-terms` to admit mug/stainless labels from new takes while
 keeping explicit object/take exclusions and the target-window viability gate.
+For dataset-wide scans, run Python unbuffered (`python -u`) and capture both
+stdout and stderr with `tee`; the selector reports progress every 25 cases.
 
 Each selected case now runs only five independent SAM3 frame segmentations, not
 multi-window video tracking. The job should therefore be much shorter than the

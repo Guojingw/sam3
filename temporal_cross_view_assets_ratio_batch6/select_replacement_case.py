@@ -158,6 +158,12 @@ def main() -> int:
     parser.add_argument("--min-mask-ratio", type=float, default=0.01)
     parser.add_argument("--min-source-frames", type=int, default=3)
     parser.add_argument("--min-target-frames", type=int, default=100)
+    parser.add_argument(
+        "--progress-every",
+        type=int,
+        default=25,
+        help="Print scan progress after this many discovered cases.",
+    )
     parser.add_argument("--exclude-object", action="append", default=[])
     parser.add_argument("--exclude-take", action="append", default=[])
     parser.add_argument(
@@ -213,7 +219,22 @@ def main() -> int:
 
     rows = []
     cases = generator.discover_cases(args.data_root, "annotation.json", [])
+    print(
+        f"Discovered {len(cases)} object cases under {args.data_root}; "
+        f"excluded_takes={len(excluded_takes)} existing_cases={len(existing)}",
+        file=sys.stderr,
+        flush=True,
+    )
     for position, case in enumerate(cases, start=1):
+        if position == 1 or (
+            args.progress_every > 0 and position % args.progress_every == 0
+        ):
+            print(
+                f"[scan {position}/{len(cases)}] eligible_so_far={len(rows)} "
+                f"current={case.case_id}",
+                file=sys.stderr,
+                flush=True,
+            )
         if (
             case.case_id in existing
             or case.object_name in excluded_objects
@@ -225,7 +246,11 @@ def main() -> int:
         try:
             row = score_case(case, args.source_prefix, args.target_prefix)
         except Exception as error:
-            print(f"[WARN] {case.case_id}: {error}", file=sys.stderr)
+            print(
+                f"[WARN] {case.case_id}: {error}",
+                file=sys.stderr,
+                flush=True,
+            )
             continue
         if not row:
             continue
@@ -238,8 +263,12 @@ def main() -> int:
         if row["viable_target_camera_count"] < 1:
             continue
         rows.append(row)
-        if position % 100 == 0:
-            print(f"scanned {position}/{len(cases)}", file=sys.stderr)
+
+    print(
+        f"Scan complete: discovered={len(cases)} eligible={len(rows)}",
+        file=sys.stderr,
+        flush=True,
+    )
 
     rows.sort(
         key=lambda row: (
