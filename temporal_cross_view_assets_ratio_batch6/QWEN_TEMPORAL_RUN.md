@@ -15,8 +15,9 @@ only adds display masks.
    - shorter than 20%: pad to at least 20% using the nearest frames on both sides;
    - between 20% and 30%: retain the exact occurrence span;
    - longer than 30%: keep the strongest continuous 30% slice.
-   Boundary overflow is moved to the available side, so an occurrence near the
-   start or end still receives the required duration.
+   Boundary overflow is moved to the available side. If fragmented extraction
+   leaves fewer contiguous frames than the preferred 20%, retain the best short
+   run and record its ratio shortfall rather than returning no window.
 4. Dense 20%, 25%, and 30% sliding windows remain comparison baselines. Qwen
    independently verifies the strongest occurrence-centered and dense windows.
 5. Deterministic scoring selects the final continuous window. The result is
@@ -137,9 +138,9 @@ Use the dataset-wide quality scanner to replace an ambiguous item such as
 directory, returns at most one object per remaining take and one case per object
 label, and by default avoids names containing `mug` or `stainless`. This
 prevents a batch from silently becoming several objects from one scene or the
-same object repeated across scenes. A candidate must also have at least one
-target camera with a contiguous run long enough to form a 20% window; raw image
-count alone is not sufficient:
+same object repeated across scenes. Preferred-duration and short-fallback target
+cameras are reported separately; fragmented extraction remains eligible but is
+audited explicitly:
 
 ```bash
 DATA="$HOME/scratch/datasets/Ego-Exo4D-Relation-Test/extracted/work/yuqian_fu/Ego/data_segswap_test"

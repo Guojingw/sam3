@@ -91,6 +91,8 @@ def target_frame_statistics(take_dir: Path, prefix: str) -> dict[str, Any]:
     total = 0
     largest_run = 0
     viable_camera_count = 0
+    preferred_duration_camera_count = 0
+    short_fallback_camera_count = 0
     for path in take_dir.iterdir():
         if not path.is_dir() or not path.name.startswith(prefix):
             continue
@@ -101,11 +103,19 @@ def target_frame_statistics(take_dir: Path, prefix: str) -> dict[str, Any]:
         largest_run = max(largest_run, camera_run)
         minimum_window = max(2, math.floor(camera_count * 0.20))
         if camera_run >= minimum_window:
+            preferred_duration_camera_count += 1
+            viable_camera_count += 1
+        elif camera_count > 0:
+            short_fallback_camera_count += 1
             viable_camera_count += 1
     return {
         "target_frame_count": total,
         "largest_contiguous_target_run": largest_run,
         "viable_target_camera_count": viable_camera_count,
+        "preferred_duration_target_camera_count": (
+            preferred_duration_camera_count
+        ),
+        "short_fallback_target_camera_count": short_fallback_camera_count,
     }
 
 
@@ -145,6 +155,12 @@ def score_case(
             "largest_contiguous_target_run"
         ],
         "viable_target_camera_count": target["viable_target_camera_count"],
+        "preferred_duration_target_camera_count": target[
+            "preferred_duration_target_camera_count"
+        ],
+        "short_fallback_target_camera_count": target[
+            "short_fallback_target_camera_count"
+        ],
         "warning_count": len(warnings),
     }
 

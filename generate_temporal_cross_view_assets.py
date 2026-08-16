@@ -758,6 +758,22 @@ def generate_target_windows(
                     candidate_windows.append(
                         (run_index, window, window_size, requested_ratio)
                     )
+        if ratio_mode:
+            # A preferred 20%-30% window is not always available in sparsely
+            # extracted data. Preserve every otherwise-unrepresented run as a
+            # best-effort short candidate instead of producing zero inputs.
+            represented_runs = {item[0] for item in candidate_windows}
+            for run_index, run in enumerate(runs):
+                if run_index in represented_runs or not run:
+                    continue
+                candidate_windows.append(
+                    (
+                        run_index,
+                        list(run),
+                        len(run),
+                        len(run) / max(1, len(sampled_frames)),
+                    )
+                )
         candidate_windows.sort(
             key=lambda item: (
                 item[1][0].frame_id,
@@ -839,6 +855,18 @@ def generate_target_windows(
                         ),
                         "ratio_error_sampled_frames": (
                             actual_sampled_ratio - requested_ratio
+                        ),
+                        "duration_fallback_allowed": bool(
+                            ratio_mode
+                            and requested_ratio < min(window_ratios)
+                        ),
+                        "preferred_min_video_ratio": (
+                            min(window_ratios) if ratio_mode else None
+                        ),
+                        "preferred_ratio_shortfall": (
+                            max(0.0, min(window_ratios) - actual_sampled_ratio)
+                            if ratio_mode
+                            else 0.0
                         ),
                     }
                 )

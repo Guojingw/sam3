@@ -22,7 +22,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 CASE_GLOB = "*__*"
 EVIDENCE_SCHEMA_VERSION = 5
-WINDOW_VERIFICATION_SCHEMA_VERSION = 9
+WINDOW_VERIFICATION_SCHEMA_VERSION = 10
 RESULT_SCHEMA_VERSION = 14
 FINAL_RESULT_SCHEMA_VERSION = 14
 CONFIRMED_THRESHOLD = 0.50
@@ -348,6 +348,27 @@ def camera_frame_ids(camera: Mapping[str, Any]) -> list[int]:
     )
 
 
+def contiguous_timeline_segments(
+    frame_ids: Sequence[int], threshold: float | None
+) -> list[tuple[int, int]]:
+    """Return inclusive sampled-index ranges separated by large frame gaps."""
+    if not frame_ids:
+        return []
+    starts = [0]
+    if threshold is not None:
+        starts.extend(
+            index + 1
+            for index, (left, right) in enumerate(
+                zip(frame_ids, frame_ids[1:])
+            )
+            if right - left > threshold
+        )
+    return [
+        (start, next_start - 1)
+        for start, next_start in zip(starts, [*starts[1:], len(frame_ids)])
+    ]
+
+
 def occurrence_centered_windows(
     index: Mapping[str, Any],
     evidence: list[dict[str, Any]],
@@ -373,112 +394,140 @@ def occurrence_centered_windows(
         frame_ids = camera_frame_ids(camera)
         if len(frame_ids) < 2:
             continue
-        first = bisect.bisect_left(frame_ids, int(run["first_confirmed_frame"]))
-        last = bisect.bisect_right(frame_ids, int(run["last_confirmed_frame"])) - 1
-        if first >= len(frame_ids) or last < first:
-            continue
         minimum_length = max(2, math.ceil(len(frame_ids) * minimum_ratio))
         maximum_length = max(
             minimum_length, math.floor(len(frame_ids) * maximum_ratio)
         )
         maximum_length = min(len(frame_ids), maximum_length)
-        occurrence_length = last - first + 1
-        desired_length = min(max(occurrence_length, minimum_length), maximum_length)
         threshold = camera.get("continuity_split_threshold")
-        segment_start = 0
-        segment_end = len(frame_ids) - 1
-        if threshold is not None:
-            for index_in_timeline, (left, right) in enumerate(
-                zip(frame_ids, frame_ids[1:])
-            ):
-                if right - left <= float(threshold):
-                    continue
-                if index_in_timeline < first:
-                    segment_start = index_in_timeline + 1
-                elif index_in_timeline < last:
-                    segment_start = segment_end + 1
-                    break
-                else:
-                    segment_end = index_in_timeline
-                    break
-        if (
-            segment_start > first
-            or segment_end < last
-            or segment_end - segment_start + 1 < desired_length
-        ):
-            continue
-
-        if occurrence_length <= desired_length:
-            missing = desired_length - occurrence_length
-            start = first - missing // 2
-            start = max(
-                segment_start,
-                min(start, segment_end - desired_length + 1),
-            )
-        else:
-            possible_starts = range(first, last - desired_length + 2)
-
-            def slice_strength(start_index: int) -> tuple[float, int, float]:
-                items = [
-                    evidence_map.get((cam, frame_id), {})
-                    for frame_id in frame_ids[
-                        start_index : start_index + desired_length
-                    ]
-                ]
-                return (
-                    sum(float(item.get("evidence_score", 0.0)) for item in items),
-                    sum(is_confirmed(item) for item in items),
-                    -abs(
-                        (start_index + (desired_length - 1) / 2)
-                        - (first + last) / 2
-                    ),
-                )
-
-            start = max(possible_starts, key=slice_strength)
-        end = start + desired_length - 1
-        ids = frame_ids[start : end + 1]
-        gaps = [right - left for left, right in zip(ids, ids[1:])]
-        video_span = max(1, frame_ids[-1] - frame_ids[0])
-        core_start = max(start, first)
-        core_end = min(end, last)
-        output.append(
-            {
-                "window_id": f"{cam}_occurrence_{run_index:03d}_adaptive",
-                "cam": cam,
-                "start_index": start,
-                "start_frame": ids[0],
-                "end_frame": ids[-1],
-                "frame_ids": ids,
-                "representative_frame_ids": representative_ids(ids, 5),
-                "requested_video_ratio": (
-                    minimum_ratio
-                    if occurrence_length < minimum_length
-                    else maximum_ratio
-                    if occurrence_length > maximum_length
-                    else occurrence_length / len(frame_ids)
-                ),
-                "actual_sampled_frame_ratio": desired_length / len(frame_ids),
-                "actual_frame_span_ratio": (ids[-1] - ids[0]) / video_span,
-                "continuity_ok": bool(
-                    not gaps
-                    or threshold is None
-                    or max(gaps) <= float(threshold)
-                ),
-                "window_construction": "occurrence_centered_nearest_padding",
-                "occurrence_core_start_frame": frame_ids[core_start],
-                "occurrence_core_end_frame": frame_ids[core_end],
-                "occurrence_sampled_frame_count": occurrence_length,
-                "padding_sampled_frames_before": max(0, first - start),
-                "padding_sampled_frames_after": max(0, end - last),
-                "duration_adjustment": (
-                    "nearest_padding"
-                    if occurrence_length < minimum_length
-                    else "strongest_continuous_slice"
-                    if occurrence_length > maximum_length
-                    else "exact_occurrence"
-                ),
-            }
+        frame_positions = {frame_id: index for index, frame_id in enumerate(frame_ids)}
+        supported_positions = sorted(
+            frame_positions[int(item["frame_id"])]
+            for item in evidence
+            if str(item["cam"]) == cam
+            and int(run["first_confirmed_frame"])
+            <= int(item["frame_id"])
+            <= int(run["last_confirmed_frame"])
+            and int(item["frame_id"]) in frame_positions
+            and is_supported(item)
         )
+        segments = contiguous_timeline_segments(
+            frame_ids, float(threshold) if threshold is not None else None
+        )
+        for segment_index, (segment_start, segment_end) in enumerate(segments):
+            segment_supported = [
+                position
+                for position in supported_positions
+                if segment_start <= position <= segment_end
+            ]
+            if not segment_supported:
+                continue
+            first = segment_supported[0]
+            last = segment_supported[-1]
+            occurrence_length = last - first + 1
+            segment_capacity = segment_end - segment_start + 1
+            short_fallback = segment_capacity < minimum_length
+            desired_length = (
+                segment_capacity
+                if short_fallback
+                else min(
+                    max(occurrence_length, minimum_length), maximum_length
+                )
+            )
+
+            if occurrence_length <= desired_length:
+                missing = desired_length - occurrence_length
+                start = first - missing // 2
+                start = max(
+                    segment_start,
+                    min(start, segment_end - desired_length + 1),
+                )
+            else:
+                possible_starts = range(first, last - desired_length + 2)
+
+                def slice_strength(start_index: int) -> tuple[float, int, float]:
+                    items = [
+                        evidence_map.get((cam, frame_id), {})
+                        for frame_id in frame_ids[
+                            start_index : start_index + desired_length
+                        ]
+                    ]
+                    return (
+                        sum(
+                            float(item.get("evidence_score", 0.0))
+                            for item in items
+                        ),
+                        sum(is_confirmed(item) for item in items),
+                        -abs(
+                            (start_index + (desired_length - 1) / 2)
+                            - (first + last) / 2
+                        ),
+                    )
+
+                start = max(possible_starts, key=slice_strength)
+            end = start + desired_length - 1
+            ids = frame_ids[start : end + 1]
+            gaps = [right - left for left, right in zip(ids, ids[1:])]
+            video_span = max(1, frame_ids[-1] - frame_ids[0])
+            multiple_segments = len(segments) > 1
+            segment_label = (
+                f"_seg{segment_index:03d}" if multiple_segments else ""
+            )
+            actual_ratio = desired_length / len(frame_ids)
+            output.append(
+                {
+                    "window_id": (
+                        f"{cam}_occurrence_{run_index:03d}"
+                        f"{segment_label}_adaptive"
+                    ),
+                    "cam": cam,
+                    "start_index": start,
+                    "start_frame": ids[0],
+                    "end_frame": ids[-1],
+                    "frame_ids": ids,
+                    "representative_frame_ids": representative_ids(ids, 5),
+                    "requested_video_ratio": (
+                        actual_ratio
+                        if short_fallback
+                        else minimum_ratio
+                        if occurrence_length < minimum_length
+                        else maximum_ratio
+                        if occurrence_length > maximum_length
+                        else occurrence_length / len(frame_ids)
+                    ),
+                    "actual_sampled_frame_ratio": actual_ratio,
+                    "actual_frame_span_ratio": (ids[-1] - ids[0]) / video_span,
+                    "continuity_ok": bool(
+                        not gaps
+                        or threshold is None
+                        or max(gaps) <= float(threshold)
+                    ),
+                    "window_construction": (
+                        "best_effort_short_contiguous_occurrence"
+                        if short_fallback
+                        else "occurrence_centered_nearest_padding"
+                    ),
+                    "occurrence_core_start_frame": frame_ids[first],
+                    "occurrence_core_end_frame": frame_ids[last],
+                    "occurrence_sampled_frame_count": occurrence_length,
+                    "padding_sampled_frames_before": max(0, first - start),
+                    "padding_sampled_frames_after": max(0, end - last),
+                    "duration_fallback_allowed": short_fallback,
+                    "preferred_min_video_ratio": minimum_ratio,
+                    "preferred_ratio_shortfall": max(
+                        0.0, minimum_ratio - actual_ratio
+                    ),
+                    "duration_adjustment": (
+                        "short_contiguous_fallback"
+                        if short_fallback
+                        else "nearest_padding"
+                        if occurrence_length < minimum_length
+                        else "strongest_continuous_slice"
+                        if occurrence_length > maximum_length
+                        else "exact_occurrence"
+                    ),
+                }
+            )
     return output
 
 
@@ -1702,7 +1751,13 @@ def legal_window_duration(window: Mapping[str, Any]) -> bool:
     actual ratio is 19.86%.
     """
     requested = float(window.get("requested_video_ratio", 0.0))
-    return 0.20 <= requested <= 0.30
+    return bool(
+        0.20 <= requested <= 0.30
+        or (
+            window.get("duration_fallback_allowed")
+            and 0.0 < float(window.get("actual_sampled_frame_ratio", 0.0)) < 0.20
+        )
+    )
 
 
 def source_frame_proximity(
@@ -1814,6 +1869,7 @@ def select_dense_verification_candidates(
             ),
         )
         for window in dense_sliding_windows(temporal_index)
+        if window.get("continuity_ok") and legal_window_duration(window)
     ]
     ranked.sort(
         key=lambda entry: (
@@ -2100,7 +2156,8 @@ parts, true color, and material. Do not infer presence from scene activity or
 from another frame. A positive frame requires a tight bbox around the target
 itself; do not box a person, hand, table, appliance, or nearby object. Bbox
 coordinates are normalized within that one standalone image. The object may be
-absent in most of the legal 20% window.
+absent in most of a preferred 20%-30% window, and a shorter best-effort window
+may be used when the extracted timeline is fragmented.
 
 Return JSON only:
 {{
@@ -2461,7 +2518,10 @@ def analyze_windows(
         )
         score["occurrence_fitted_window"] = float(
             window.get("window_construction")
-            == "occurrence_centered_nearest_padding"
+            in {
+                "occurrence_centered_nearest_padding",
+                "best_effort_short_contiguous_occurrence",
+            }
         )
         verification = window_verifications.get(str(window["window_id"]))
         strong_verified = strong_crop_verified_frames(verification)
@@ -2615,8 +2675,9 @@ def analyze_windows(
         "source_identity": identity,
         "occurrence_spans": runs,
         "selection_constraints": {
-            "window_ratio_min": 0.20,
+            "preferred_window_ratio_min": 0.20,
             "window_ratio_max": 0.30,
+            "short_contiguous_fallback_allowed": True,
             "minimum_captured_supported_frames": 1,
             "minimum_captured_confirmed_frames": 1,
             "minimum_crop_verified_identity_frames": 1,
@@ -2637,8 +2698,10 @@ def analyze_windows(
                 "fit a window to every verified occurrence; pad short "
                 "occurrences with the nearest surrounding frames, retain "
                 "20%-30% occurrences exactly, cap longer occurrences at the "
-                "strongest continuous 30% slice, then compare against dense "
-                "fixed-ratio baselines with strict Qwen identity verification"
+                "strongest continuous 30% slice, and retain the best shorter "
+                "contiguous run when insufficient frames exist; then compare "
+                "against dense fixed-ratio baselines with strict Qwen identity "
+                "verification"
             ),
             "ranking_weights": {
                 "independently_verified_frame_fraction": 0.20,
@@ -2674,9 +2737,9 @@ def analyze_windows(
             "warning": "No Qwen-selected temporal window exists to segment.",
         }
         result["uncertainty"] = (
-            "No occurrence-fitted or dense 20%-30% continuous window contains "
-            "a confirmed localized scout and an independently crop-verified "
-            "strong identity match."
+            "No occurrence-fitted preferred-duration or best-effort short "
+            "window contains a confirmed localized scout and an independently "
+            "crop-verified strong identity match."
         )
         result["confidence"] = round(
             max((entry[2]["overall"] for entry in candidates), default=0.0), 4
@@ -2757,6 +2820,12 @@ def analyze_windows(
         "padding_sampled_frames_after": int(
             window.get("padding_sampled_frames_after", 0)
         ),
+        "duration_fallback_allowed": bool(
+            window.get("duration_fallback_allowed", False)
+        ),
+        "preferred_ratio_shortfall": round(
+            float(window.get("preferred_ratio_shortfall", 0.0)), 6
+        ),
         "captured_occurrence": {
             key: score[key]
             for key in (
@@ -2819,10 +2888,11 @@ def analyze_windows(
         },
         "confidence": round(score["overall"], 4),
         "reason_selected": (
-            "Highest-scoring identity-verified continuous 20%-30% Qwen "
-            "window fitted to the detected occurrence. Short occurrences are "
-            "extended using the nearest surrounding frames. SAM3 is optional "
-            "and does not affect temporal selection."
+            "Highest-scoring identity-verified Qwen window fitted to the "
+            "detected occurrence. The preferred duration is 20%-30%; short "
+            "occurrences are extended with nearest surrounding frames, while "
+            "fragmented inputs retain their best shorter contiguous run. SAM3 "
+            "is optional and does not affect temporal selection."
         ),
         "recommended_sam_prompt": (
             f"Segment the {identity.get('object_identity', metadata['target_object'])} "

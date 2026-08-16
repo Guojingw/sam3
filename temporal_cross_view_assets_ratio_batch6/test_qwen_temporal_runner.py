@@ -200,6 +200,38 @@ class TemporalSelectionTests(unittest.TestCase):
         self.assertGreaterEqual(adaptive["start_frame"], 100)
         self.assertNotIn(4, adaptive["frame_ids"])
 
+    def test_short_contiguous_run_is_valid_best_effort_fallback(self) -> None:
+        frame_ids = [*range(8), *range(100, 150)]
+        index = {
+            "cameras": {
+                "cam01": {
+                    "windows": [{"frame_ids": frame_ids}],
+                    "continuity_split_threshold": 2,
+                }
+            }
+        }
+        evidence = []
+        for frame_id in frame_ids:
+            present = frame_id == 3
+            evidence.append(
+                {
+                    "cam": "cam01",
+                    "frame_id": frame_id,
+                    "model_presence": "confirmed" if present else "absent",
+                    "bbox_xyxy_normalized": [0.2, 0.2, 0.4, 0.4] if present else None,
+                    "visibility": 0.9 if present else 0.0,
+                    "identity_confidence": 0.9 if present else 0.0,
+                    "evidence_score": 0.9 if present else 0.0,
+                }
+            )
+        adaptive = runner.occurrence_centered_windows(index, evidence)[0]
+        self.assertEqual(
+            adaptive["duration_adjustment"], "short_contiguous_fallback"
+        )
+        self.assertEqual(adaptive["frame_ids"], list(range(8)))
+        self.assertLess(adaptive["actual_sampled_frame_ratio"], 0.20)
+        self.assertTrue(runner.legal_window_duration(adaptive))
+
     def test_single_unverified_glimpse_remains_uncertain(self) -> None:
         evidence = synthetic_evidence(1200, 1200)
         result = runner.analyze_windows(
