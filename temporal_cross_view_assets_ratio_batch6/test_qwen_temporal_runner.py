@@ -154,6 +154,16 @@ class TemporalSelectionTests(unittest.TestCase):
         self.assertGreater(adaptive["padding_sampled_frames_after"], 0)
         self.assertGreaterEqual(adaptive["actual_sampled_frame_ratio"], 0.20)
 
+    def test_discrete_twenty_percent_rounding_is_legal(self) -> None:
+        self.assertTrue(
+            runner.legal_window_duration(
+                {
+                    "requested_video_ratio": 0.20,
+                    "actual_sampled_frame_ratio": 29 / 146,
+                }
+            )
+        )
+
     def test_long_occurrence_is_capped_at_thirty_percent(self) -> None:
         evidence = synthetic_evidence(600, 3300)
         adaptive = runner.occurrence_centered_windows(self.index, evidence)[0]

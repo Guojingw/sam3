@@ -1672,7 +1672,7 @@ def score_window(
     )
     valid = (
         bool(window.get("continuity_ok"))
-        and 0.20 <= float(window["actual_sampled_frame_ratio"]) <= 0.30
+        and legal_window_duration(window)
         and support_fraction >= WINDOW_SUPPORT_FRACTION
         and confirmed_fraction >= WINDOW_CONFIRMED_FRACTION
         and longest_absence <= MAX_INTERNAL_ABSENT_RUN
@@ -1692,6 +1692,17 @@ def score_window(
         "bbox_temporal_stability": bbox_stability,
         "overall": overall,
     }
+
+
+def legal_window_duration(window: Mapping[str, Any]) -> bool:
+    """Accept legal requested ratios despite unavoidable frame rounding.
+
+    For example, 20% of 146 sampled frames is 29.2 frames. A generated
+    29-frame window is the nearest discrete 20% window even though its reported
+    actual ratio is 19.86%.
+    """
+    requested = float(window.get("requested_video_ratio", 0.0))
+    return 0.20 <= requested <= 0.30
 
 
 def source_frame_proximity(
@@ -2448,6 +2459,10 @@ def analyze_windows(
         score["occurrence_alignment_score"] = occurrence_alignment_score(
             window, capture
         )
+        score["occurrence_fitted_window"] = float(
+            window.get("window_construction")
+            == "occurrence_centered_nearest_padding"
+        )
         verification = window_verifications.get(str(window["window_id"]))
         strong_verified = strong_crop_verified_frames(verification)
         representative = max(
@@ -2481,14 +2496,15 @@ def analyze_windows(
             + 0.22 * score["captured_occurrence_fraction"]
             + 0.15 * score["occurrence_alignment_score"]
             + 0.12 * score["real_probe_support_fraction"]
-            + 0.05 * score["source_frame_temporal_prior"]
+            + 0.03 * score["occurrence_fitted_window"]
+            + 0.02 * score["source_frame_temporal_prior"]
             + 0.05 * score["mean_object_completeness"]
             + 0.02 * score["mean_bbox_tightness"]
             + 0.01 * score["mean_target_scale_score"]
         )
         score["valid"] = bool(
             window.get("continuity_ok")
-            and 0.20 <= float(window["actual_sampled_frame_ratio"]) <= 0.30
+            and legal_window_duration(window)
             and score["overlaps_occurrence"]
             and score["captured_supported_count"] >= 1
             and score["captured_confirmed_count"] >= 1
@@ -2630,7 +2646,8 @@ def analyze_windows(
                 "captured_occurrence_fraction": 0.22,
                 "occurrence_alignment": 0.15,
                 "real_probe_support_fraction": 0.12,
-                "source_frame_temporal_prior": 0.05,
+                "occurrence_fitted_window": 0.03,
+                "source_frame_temporal_prior": 0.02,
                 "mean_object_completeness": 0.05,
                 "mean_bbox_tightness": 0.02,
                 "mean_target_scale_score": 0.01,
@@ -2657,8 +2674,9 @@ def analyze_windows(
             "warning": "No Qwen-selected temporal window exists to segment.",
         }
         result["uncertainty"] = (
-            "No dense 20%-30% continuous window contains a confirmed localized "
-            "scout and an independently crop-verified strong identity match."
+            "No occurrence-fitted or dense 20%-30% continuous window contains "
+            "a confirmed localized scout and an independently crop-verified "
+            "strong identity match."
         )
         result["confidence"] = round(
             max((entry[2]["overall"] for entry in candidates), default=0.0), 4
