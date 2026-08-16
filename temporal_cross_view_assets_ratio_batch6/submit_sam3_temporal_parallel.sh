@@ -31,7 +31,7 @@ for case_dir in "$ASSETS"/*__*; do
       .best_segment != null and
       ((.schema_version == 11 and
         .pipeline_status == "awaiting_final_sam3_segmentation") or
-       (.schema_version >= 14 and
+       (.schema_version >= 13 and
         .pipeline_status == "complete" and
         ((.final_segmentation.status == "not_requested") or
          ((.final_segmentation.schema_version // 0) < 2))))
