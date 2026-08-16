@@ -8,6 +8,7 @@ import importlib
 import json
 import math
 import sys
+from collections import Counter
 from pathlib import Path
 from statistics import median
 from typing import Any
@@ -148,6 +149,24 @@ def score_case(
     }
 
 
+def quality_rejection_reasons(
+    row: dict[str, Any],
+    min_mask_ratio: float,
+    min_source_frames: int,
+    min_target_frames: int,
+) -> list[str]:
+    reasons = []
+    if row["best_source_mask_ratio"] < min_mask_ratio:
+        reasons.append("source_mask_ratio_below_minimum")
+    if row["valid_source_mask_frames"] < min_source_frames:
+        reasons.append("source_mask_frames_below_minimum")
+    if row["target_frame_count"] < min_target_frames:
+        reasons.append("target_frames_below_minimum")
+    if row["viable_target_camera_count"] < 1:
+        reasons.append("no_contiguous_20_percent_target_window")
+    return reasons
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-root", type=Path, required=True)
@@ -218,6 +237,8 @@ def main() -> int:
     avoid_terms.extend(term.lower() for term in args.avoid_term)
 
     rows = []
+    near_misses = []
+    rejection_counts: Counter[str] = Counter()
     cases = generator.discover_cases(args.data_root, "annotation.json", [])
     print(
         f"Discovered {len(cases)} object cases under {args.data_root}; "
@@ -235,17 +256,22 @@ def main() -> int:
                 file=sys.stderr,
                 flush=True,
             )
-        if (
-            case.case_id in existing
-            or case.object_name in excluded_objects
-            or case.take_id in excluded_takes
-        ):
+        if case.case_id in existing:
+            rejection_counts["case_already_in_assets"] += 1
+            continue
+        if case.object_name in excluded_objects:
+            rejection_counts["explicitly_excluded_object"] += 1
+            continue
+        if case.take_id in excluded_takes:
+            rejection_counts["take_already_represented_or_excluded"] += 1
             continue
         if any(term in case.object_name.lower() for term in avoid_terms):
+            rejection_counts["object_name_avoid_term"] += 1
             continue
         try:
             row = score_case(case, args.source_prefix, args.target_prefix)
         except Exception as error:
+            rejection_counts["case_scan_error"] += 1
             print(
                 f"[WARN] {case.case_id}: {error}",
                 file=sys.stderr,
@@ -253,16 +279,20 @@ def main() -> int:
             )
             continue
         if not row:
+            rejection_counts["no_usable_source_mask"] += 1
             continue
-        if row["best_source_mask_ratio"] < args.min_mask_ratio:
-            continue
-        if row["valid_source_mask_frames"] < args.min_source_frames:
-            continue
-        if row["target_frame_count"] < args.min_target_frames:
-            continue
-        if row["viable_target_camera_count"] < 1:
+        reasons = quality_rejection_reasons(
+            row,
+            args.min_mask_ratio,
+            args.min_source_frames,
+            args.min_target_frames,
+        )
+        if reasons:
+            rejection_counts.update(reasons)
+            near_misses.append({**row, "rejection_reasons": reasons})
             continue
         rows.append(row)
+        rejection_counts["eligible"] += 1
 
     print(
         f"Scan complete: discovered={len(cases)} eligible={len(rows)}",
@@ -284,9 +314,37 @@ def main() -> int:
         one_per_take=not args.allow_multiple_per_take,
         one_per_object=not args.allow_duplicate_objects,
     )
+    near_misses.sort(
+        key=lambda row: (
+            -len(row["rejection_reasons"]),
+            row["quality_score"],
+            row["best_source_mask_ratio"],
+        ),
+        reverse=True,
+    )
+    diverse_near_misses = diverse_recommendations(near_misses, 20)
+    eligible_take_summaries = []
+    for take_id in sorted({row["take_id"] for row in rows}):
+        take_rows = [row for row in rows if row["take_id"] == take_id]
+        best = max(take_rows, key=lambda row: row["quality_score"])
+        eligible_take_summaries.append(
+            {
+                "take_id": take_id,
+                "eligible_case_count": len(take_rows),
+                "best_case_id": best["case_id"],
+                "best_quality_score": best["quality_score"],
+            }
+        )
     payload = {
+        "discovered_case_count": len(cases),
         "eligible_case_count": len(rows),
         "eligible_take_count": len({row["take_id"] for row in rows}),
+        "rejection_counts": dict(sorted(rejection_counts.items())),
+        "eligible_take_summaries": eligible_take_summaries,
+        "near_miss_take_count": len(
+            {row["take_id"] for row in near_misses}
+        ),
+        "near_misses": diverse_near_misses,
         "excluded_existing_take_ids": sorted(represented_takes),
         "one_recommendation_per_take": not args.allow_multiple_per_take,
         "one_recommendation_per_object": not args.allow_duplicate_objects,

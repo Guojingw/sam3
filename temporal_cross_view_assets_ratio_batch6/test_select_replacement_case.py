@@ -66,6 +66,28 @@ class ReplacementSelectionTests(unittest.TestCase):
         )
         self.assertEqual(len(selected), 2)
 
+    def test_quality_rejection_reasons_report_every_failed_gate(self) -> None:
+        reasons = selector.quality_rejection_reasons(
+            {
+                "best_source_mask_ratio": 0.002,
+                "valid_source_mask_frames": 0,
+                "target_frame_count": 20,
+                "viable_target_camera_count": 0,
+            },
+            min_mask_ratio=0.003,
+            min_source_frames=1,
+            min_target_frames=30,
+        )
+        self.assertEqual(
+            reasons,
+            [
+                "source_mask_ratio_below_minimum",
+                "source_mask_frames_below_minimum",
+                "target_frames_below_minimum",
+                "no_contiguous_20_percent_target_window",
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
