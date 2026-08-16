@@ -1,6 +1,7 @@
-# Qwen temporal selection and final SAM3 visualization
+# First-person-mask anchored Qwen temporal selection
 
-The pipeline has two strictly separated stages.
+The required pipeline ends with Qwen temporal selection. SAM3 is optional and
+only adds display masks.
 
 ## Decision ownership
 
@@ -9,27 +10,39 @@ The pipeline has two strictly separated stages.
 2. Qwen searches the synchronized third-person timeline from the source frame in
    both directions, refines positive areas, and verifies identity on standalone
    crops.
-3. Code scores dense sliding windows at every sampled-frame start for 20%, 25%,
-   and 30% video lengths. This includes windows that cross old fixed boundaries.
-4. Qwen and deterministic scoring select the final continuous window. The result
-   is saved in both `best_segment` and immutable `qwen_temporal_selection`.
-5. A brief occurrence may be accepted from one independently crop-verified
+3. Code first derives the target's verified occurrence span in each third-person
+   camera, then constructs an occurrence-centered window:
+   - shorter than 20%: pad to at least 20% using the nearest frames on both sides;
+   - between 20% and 30%: retain the exact occurrence span;
+   - longer than 30%: keep the strongest continuous 30% slice.
+   Boundary overflow is moved to the available side, so an occurrence near the
+   start or end still receives the required duration.
+4. Dense 20%, 25%, and 30% sliding windows remain comparison baselines. Qwen
+   independently verifies the strongest occurrence-centered and dense windows.
+5. Deterministic scoring selects the final continuous window. The result is
+   saved in both `best_segment` and `qwen_temporal_selection`.
+6. A brief occurrence may be accepted from one independently crop-verified
    frame when confidence is at least 0.90, at least two physical identity cues
-   match, and no cue conflicts. Code pads the chosen interval to a legal 20%
-   window.
-6. If Qwen has no valid identity-supported window, the result stays `uncertain`.
+   match, and no cue conflicts.
+7. If Qwen has no valid identity-supported window, the result stays `uncertain`.
 
 SAM3 does not search time, rerank windows, reject a Qwen window, or change
 `success` to `uncertain`.
 
-## Final visualization
+Successful Qwen output is schema 14 with `pipeline_status=complete`. Important
+window fields include `duration_adjustment`, `padding_sampled_frames_before`,
+`padding_sampled_frames_after`, and `captured_occurrence`.
+
+## Optional SAM3 visualization
 
 After a Qwen window is selected, SAM3 independently segments five representative
 frames from that one window. It first uses the source-derived object identity as
 a text prompt. A Qwen bbox is only a fallback when text produces no mask and is
 never used to rank time.
 
-Final output is schema 13:
+Without SAM3, `final_segmentation.status` is `not_requested`. This is a complete
+result, not a missing pipeline stage. If SAM3 is run later, it may populate
+display masks but must not change `qwen_temporal_selection`.
 
 - `qwen_temporal_selection`: the time decision.
 - `final_segmentation.role`: always `visualization_only`.
@@ -56,8 +69,7 @@ WORK="$HOME/scratch/qwen35-4b/temporal_easy6_native_tiles_v3"
 cd "$HOME/worldmodel/sam3/temporal_cross_view_assets_ratio_batch6"
 ```
 
-Audit every case before submitting jobs. Legacy schema-2 results (including an
-old `yellow_tea_strainer_0` result) must return to Qwen before SAM3:
+Audit every case before submitting jobs. Legacy results return to Qwen:
 
 ```bash
 "$HOME/.conda/envs/sam3/bin/python" pipeline_audit.py --assets-root "$EASY6"
@@ -71,34 +83,41 @@ bash submit_qwen_temporal_parallel.sh "$EASY6" "$WORK"
 qstat -u "$USER"
 ```
 
-Check which cases are waiting only for final masks:
+Inspect the selected ranges and padding decisions:
 
 ```bash
 for f in "$EASY6"/*/temporal_analysis_result.json; do
   jq -r '[.case_id, .status, .pipeline_status,
-          (.best_segment.window_id // "NONE")] | @tsv' "$f"
+          (.best_segment.window_id // "NONE"),
+          (.best_segment.start_frame // "NONE"),
+          (.best_segment.end_frame // "NONE"),
+          (.best_segment.duration_adjustment // "NONE"),
+          (.best_segment.padding_sampled_frames_before // 0),
+          (.best_segment.padding_sampled_frames_after // 0)] | @tsv' "$f"
 done
 ```
 
-When Qwen evidence and crop-verification caches already exist, apply updated
-window rules without loading Qwen or requesting a GPU:
+This update changes the independently verified candidate windows. Run Qwen once
+normally (not `--rescore-only`). Existing frame evidence is reused, while the
+old verification cache is automatically replaced. For one case:
 
 ```bash
 "$HOME/.conda/envs/sam3/bin/python" qwen_temporal_runner.py \
   --assets-root "$EASY6" \
   --work-dir "$WORK" \
-  --rescore-only
+  --case '<case_id>'
 ```
 
-Submit SAM3 only after Qwen jobs finish:
+After schema-9 window verifications exist, later scoring-only code changes can
+be applied with `--rescore-only`. SAM3 submission is optional:
 
 ```bash
 bash submit_sam3_temporal_parallel.sh "$EASY6" "$WORK"
 qstat -u "$USER"
 ```
 
-Run the audit again after each stage. `needs_qwen` must reach either
-`needs_sam3` or `complete_uncertain`; only `needs_sam3` is submitted to SAM3.
+Run the audit again after Qwen. `needs_qwen` must reach either `complete` or
+`complete_uncertain`.
 `complete_uncertain` is a completed pipeline with no identity-verified window,
 not an execution failure, and must not be relabeled as a semantic success.
 
@@ -135,11 +154,7 @@ keeping explicit object/take exclusions and the target-window viability gate.
 For dataset-wide scans, run Python unbuffered (`python -u`) and capture both
 stdout and stderr with `tee`; the selector reports progress every 25 cases.
 
-Each selected case now runs only five independent SAM3 frame segmentations, not
-multi-window video tracking. The job should therefore be much shorter than the
-Qwen stage.
-
-After the SAM3 jobs finish, rebuild all rendered outputs and the batch summary:
+Rebuild rendered outputs and the batch summary without SAM3:
 
 ```bash
 PYTHON="$HOME/.conda/envs/sam3/bin/python"
@@ -155,7 +170,8 @@ Verify final state:
 for f in "$EASY6"/*/temporal_analysis_result.json; do
   jq -r '[.case_id, .schema_version, .status, .pipeline_status,
           (.best_segment.window_id // "NONE"),
-          (.final_segmentation.segmented_frame_count // 0)] | @tsv' "$f"
+          (.best_segment.duration_adjustment // "NONE"),
+          (.best_segment.actual_sampled_frame_ratio // 0)] | @tsv' "$f"
 done
 ```
 
@@ -167,7 +183,6 @@ $EASY6/<case_id>/analysis_outputs/selected_vs_rejected_region_comparison.png
 
 ## Reusing existing Qwen results
 
-Schema-11 results produced by the new Qwen code can go directly to the final
-SAM3 stage. Old schema-12 results from the former SAM3 reranker should be rerun
-through Qwen because their `best_segment` may have been changed or removed by
-the old acceptance gate.
+Schema-14 results are final temporal decisions. Schema-11 and older results
+should be rerun through Qwen because they do not contain occurrence-centered
+padding and still treat SAM3 as a required completion stage.

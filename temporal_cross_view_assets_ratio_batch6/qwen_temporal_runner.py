@@ -22,9 +22,9 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 CASE_GLOB = "*__*"
 EVIDENCE_SCHEMA_VERSION = 5
-WINDOW_VERIFICATION_SCHEMA_VERSION = 8
-RESULT_SCHEMA_VERSION = 11
-FINAL_RESULT_SCHEMA_VERSION = 13
+WINDOW_VERIFICATION_SCHEMA_VERSION = 9
+RESULT_SCHEMA_VERSION = 14
+FINAL_RESULT_SCHEMA_VERSION = 14
 CONFIRMED_THRESHOLD = 0.50
 POSSIBLE_THRESHOLD = 0.45
 STRONG_SINGLE_MATCH_CONFIDENCE = 0.90
@@ -335,6 +335,184 @@ def dense_sliding_windows(
                     }
                 )
     return output
+
+
+def camera_frame_ids(camera: Mapping[str, Any]) -> list[int]:
+    """Return the complete sampled target timeline represented by an index."""
+    return sorted(
+        {
+            int(frame_id)
+            for window in camera["windows"]
+            for frame_id in window["frame_ids"]
+        }
+    )
+
+
+def occurrence_centered_windows(
+    index: Mapping[str, Any],
+    evidence: list[dict[str, Any]],
+    minimum_ratio: float = 0.20,
+    maximum_ratio: float = 0.30,
+) -> list[dict[str, Any]]:
+    """Fit a legal window to each occurrence, padding with nearest frames.
+
+    A short occurrence is symmetrically padded to the minimum duration, with
+    boundary overflow moved to the other side. An occurrence already within
+    the requested duration range is kept exactly. A long occurrence is reduced
+    to the strongest continuous maximum-duration slice.
+    """
+    evidence_map = {
+        (str(item["cam"]), int(item["frame_id"])): item for item in evidence
+    }
+    output: list[dict[str, Any]] = []
+    for run_index, run in enumerate(occurrence_runs(evidence)):
+        cam = str(run["cam"])
+        camera = index["cameras"].get(cam)
+        if not camera:
+            continue
+        frame_ids = camera_frame_ids(camera)
+        if len(frame_ids) < 2:
+            continue
+        first = bisect.bisect_left(frame_ids, int(run["first_confirmed_frame"]))
+        last = bisect.bisect_right(frame_ids, int(run["last_confirmed_frame"])) - 1
+        if first >= len(frame_ids) or last < first:
+            continue
+        minimum_length = max(2, math.ceil(len(frame_ids) * minimum_ratio))
+        maximum_length = max(
+            minimum_length, math.floor(len(frame_ids) * maximum_ratio)
+        )
+        maximum_length = min(len(frame_ids), maximum_length)
+        occurrence_length = last - first + 1
+        desired_length = min(max(occurrence_length, minimum_length), maximum_length)
+        threshold = camera.get("continuity_split_threshold")
+        segment_start = 0
+        segment_end = len(frame_ids) - 1
+        if threshold is not None:
+            for index_in_timeline, (left, right) in enumerate(
+                zip(frame_ids, frame_ids[1:])
+            ):
+                if right - left <= float(threshold):
+                    continue
+                if index_in_timeline < first:
+                    segment_start = index_in_timeline + 1
+                elif index_in_timeline < last:
+                    segment_start = segment_end + 1
+                    break
+                else:
+                    segment_end = index_in_timeline
+                    break
+        if (
+            segment_start > first
+            or segment_end < last
+            or segment_end - segment_start + 1 < desired_length
+        ):
+            continue
+
+        if occurrence_length <= desired_length:
+            missing = desired_length - occurrence_length
+            start = first - missing // 2
+            start = max(
+                segment_start,
+                min(start, segment_end - desired_length + 1),
+            )
+        else:
+            possible_starts = range(first, last - desired_length + 2)
+
+            def slice_strength(start_index: int) -> tuple[float, int, float]:
+                items = [
+                    evidence_map.get((cam, frame_id), {})
+                    for frame_id in frame_ids[
+                        start_index : start_index + desired_length
+                    ]
+                ]
+                return (
+                    sum(float(item.get("evidence_score", 0.0)) for item in items),
+                    sum(is_confirmed(item) for item in items),
+                    -abs(
+                        (start_index + (desired_length - 1) / 2)
+                        - (first + last) / 2
+                    ),
+                )
+
+            start = max(possible_starts, key=slice_strength)
+        end = start + desired_length - 1
+        ids = frame_ids[start : end + 1]
+        gaps = [right - left for left, right in zip(ids, ids[1:])]
+        video_span = max(1, frame_ids[-1] - frame_ids[0])
+        core_start = max(start, first)
+        core_end = min(end, last)
+        output.append(
+            {
+                "window_id": f"{cam}_occurrence_{run_index:03d}_adaptive",
+                "cam": cam,
+                "start_index": start,
+                "start_frame": ids[0],
+                "end_frame": ids[-1],
+                "frame_ids": ids,
+                "representative_frame_ids": representative_ids(ids, 5),
+                "requested_video_ratio": (
+                    minimum_ratio
+                    if occurrence_length < minimum_length
+                    else maximum_ratio
+                    if occurrence_length > maximum_length
+                    else occurrence_length / len(frame_ids)
+                ),
+                "actual_sampled_frame_ratio": desired_length / len(frame_ids),
+                "actual_frame_span_ratio": (ids[-1] - ids[0]) / video_span,
+                "continuity_ok": bool(
+                    not gaps
+                    or threshold is None
+                    or max(gaps) <= float(threshold)
+                ),
+                "window_construction": "occurrence_centered_nearest_padding",
+                "occurrence_core_start_frame": frame_ids[core_start],
+                "occurrence_core_end_frame": frame_ids[core_end],
+                "occurrence_sampled_frame_count": occurrence_length,
+                "padding_sampled_frames_before": max(0, first - start),
+                "padding_sampled_frames_after": max(0, end - last),
+                "duration_adjustment": (
+                    "nearest_padding"
+                    if occurrence_length < minimum_length
+                    else "strongest_continuous_slice"
+                    if occurrence_length > maximum_length
+                    else "exact_occurrence"
+                ),
+            }
+        )
+    return output
+
+
+def temporal_candidate_windows(
+    index: Mapping[str, Any], evidence: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Combine occurrence-fitted windows with exhaustive legal baselines."""
+    return [
+        *occurrence_centered_windows(index, evidence),
+        *dense_sliding_windows(index),
+    ]
+
+
+def materialize_selected_window(
+    selection: Mapping[str, Any], index: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Restore sampled frame IDs for a persisted adaptive selection."""
+    cam = str(selection["cam"])
+    frame_ids = [
+        frame_id
+        for frame_id in camera_frame_ids(index["cameras"][cam])
+        if int(selection["start_frame"])
+        <= frame_id
+        <= int(selection["end_frame"])
+    ]
+    if not frame_ids:
+        raise KeyError(
+            f"Selected window has no indexed frames: {selection['window_id']}"
+        )
+    return {
+        **selection,
+        "frame_ids": frame_ids,
+        "representative_frame_ids": representative_ids(frame_ids, 5),
+    }
 
 
 def make_frame_catalog(
@@ -1494,7 +1672,7 @@ def score_window(
     )
     valid = (
         bool(window.get("continuity_ok"))
-        and 0.20 <= float(window["requested_video_ratio"]) <= 0.30
+        and 0.20 <= float(window["actual_sampled_frame_ratio"]) <= 0.30
         and support_fraction >= WINDOW_SUPPORT_FRACTION
         and confirmed_fraction >= WINDOW_CONFIRMED_FRACTION
         and longest_absence <= MAX_INTERNAL_ABSENT_RUN
@@ -1724,16 +1902,64 @@ def occurrence_capture(
     return best
 
 
+def occurrence_alignment_score(
+    window: Mapping[str, Any], capture: Mapping[str, Any]
+) -> float:
+    """Prefer the shortest, most centered legal window around an occurrence."""
+    first = capture.get("occurrence_first_frame")
+    last = capture.get("occurrence_last_frame")
+    if first is None or last is None:
+        return 0.0
+    window_span = max(
+        1, int(window["end_frame"]) - int(window["start_frame"])
+    )
+    occurrence_span = max(0, int(last) - int(first))
+    excess = max(0, window_span - occurrence_span)
+    compactness = max(0.0, 1.0 - excess / window_span)
+    window_midpoint = (
+        int(window["start_frame"]) + int(window["end_frame"])
+    ) / 2
+    occurrence_midpoint = (int(first) + int(last)) / 2
+    centeredness = max(
+        0.0, 1.0 - 2 * abs(window_midpoint - occurrence_midpoint) / window_span
+    )
+    return (
+        0.55 * float(capture["captured_occurrence_fraction"])
+        + 0.30 * centeredness
+        + 0.15 * compactness
+    )
+
+
 def verification_candidates(
     temporal_index: Mapping[str, Any],
     evidence: list[dict[str, Any]],
     source_frame: int,
     limit: int = MAX_WINDOWS_TO_VERIFY,
 ) -> list[tuple[Mapping[str, Any], dict[str, Any]]]:
-    """Dense every-start sliding windows followed by bounded temporal NMS."""
-    selected = select_dense_verification_candidates(
+    """Verify occurrence-fitted windows first, then strong dense baselines."""
+    dense = select_dense_verification_candidates(
         temporal_index, evidence, source_frame, limit
     )
+    evidence_map = {
+        (str(item["cam"]), int(item["frame_id"])): item for item in evidence
+    }
+    adaptive = [
+        (
+            window,
+            dense_window_fast_score(
+                window, evidence_map, temporal_index, source_frame
+            ),
+        )
+        for window in occurrence_centered_windows(temporal_index, evidence)
+    ]
+    adaptive.sort(key=lambda entry: entry[1]["fast_score"], reverse=True)
+    selected = adaptive[: max(1, limit // 2)]
+    for entry in dense:
+        if any(temporal_iou(entry[0], chosen[0]) > 0.95 for chosen in selected):
+            continue
+        selected.append(entry)
+        if len(selected) >= limit:
+            break
     return [
         (
             window,
@@ -2098,6 +2324,11 @@ Return JSON only with exactly one entry per mapped frame:
             "verification_schema_version": WINDOW_VERIFICATION_SCHEMA_VERSION,
             "window_id": window_id,
             "cam": str(window["cam"]),
+            "start_frame": int(window["start_frame"]),
+            "end_frame": int(window["end_frame"]),
+            "window_construction": window.get(
+                "window_construction", "dense_fixed_ratio"
+            ),
             "verified_frame_ids": target_frame_ids,
             "frame_results": frame_results,
             "target_in_beginning": any(
@@ -2203,7 +2434,7 @@ def analyze_windows(
     runs = occurrence_runs(evidence)
     source_frame = int(metadata["source_best"]["frame_id"])
     candidates = []
-    for window in dense_sliding_windows(temporal_index):
+    for window in temporal_candidate_windows(temporal_index, evidence):
         items = [
             evidence_map[(window["cam"], int(frame_id))]
             for frame_id in window["frame_ids"]
@@ -2214,6 +2445,9 @@ def analyze_windows(
         )
         capture = occurrence_capture(window, runs, evidence)
         score.update(capture)
+        score["occurrence_alignment_score"] = occurrence_alignment_score(
+            window, capture
+        )
         verification = window_verifications.get(str(window["window_id"]))
         strong_verified = strong_crop_verified_frames(verification)
         representative = max(
@@ -2242,18 +2476,19 @@ def analyze_windows(
                 + 0.20 * verification_identity
             )
         score["selection_score"] = (
-            0.25 * verification_frame_fraction
-            + 0.20 * verification_identity
-            + 0.25 * score["captured_occurrence_fraction"]
-            + 0.15 * score["real_probe_support_fraction"]
+            0.20 * verification_frame_fraction
+            + 0.18 * verification_identity
+            + 0.22 * score["captured_occurrence_fraction"]
+            + 0.15 * score["occurrence_alignment_score"]
+            + 0.12 * score["real_probe_support_fraction"]
             + 0.05 * score["source_frame_temporal_prior"]
             + 0.05 * score["mean_object_completeness"]
-            + 0.03 * score["mean_bbox_tightness"]
-            + 0.02 * score["mean_target_scale_score"]
+            + 0.02 * score["mean_bbox_tightness"]
+            + 0.01 * score["mean_target_scale_score"]
         )
         score["valid"] = bool(
             window.get("continuity_ok")
-            and 0.20 <= float(window["requested_video_ratio"]) <= 0.30
+            and 0.20 <= float(window["actual_sampled_frame_ratio"]) <= 0.30
             and score["overlaps_occurrence"]
             and score["captured_supported_count"] >= 1
             and score["captured_confirmed_count"] >= 1
@@ -2379,22 +2614,26 @@ def analyze_windows(
             "occurrence_qwen_verification_required": True,
         },
         "selection_algorithm": {
-            "name": "qwen_dense_sliding_window_selection",
+            "name": "qwen_occurrence_centered_temporal_selection",
             "source_frame_is_weak_prior": True,
             "window_ratios": [0.20, 0.25, 0.30],
             "candidate_comparison": (
-                "every sampled-frame start, CPU scoring, temporal NMS, and "
-                "strict Qwen identity verification"
+                "fit a window to every verified occurrence; pad short "
+                "occurrences with the nearest surrounding frames, retain "
+                "20%-30% occurrences exactly, cap longer occurrences at the "
+                "strongest continuous 30% slice, then compare against dense "
+                "fixed-ratio baselines with strict Qwen identity verification"
             ),
             "ranking_weights": {
-                "independently_verified_frame_fraction": 0.25,
-                "window_identity_verification": 0.20,
-                "captured_occurrence_fraction": 0.25,
-                "real_probe_support_fraction": 0.15,
+                "independently_verified_frame_fraction": 0.20,
+                "window_identity_verification": 0.18,
+                "captured_occurrence_fraction": 0.22,
+                "occurrence_alignment": 0.15,
+                "real_probe_support_fraction": 0.12,
                 "source_frame_temporal_prior": 0.05,
                 "mean_object_completeness": 0.05,
-                "mean_bbox_tightness": 0.03,
-                "mean_target_scale_score": 0.02,
+                "mean_bbox_tightness": 0.02,
+                "mean_target_scale_score": 0.01,
             },
         },
         "window_verifications": window_verifications,
@@ -2406,11 +2645,9 @@ def analyze_windows(
         "uncertainty": "",
         "confidence": 0.0,
         "global_challenger_comparison": None,
-        "pipeline_status": "awaiting_final_sam3_segmentation",
+        "pipeline_status": "complete",
     }
     if not selected:
-        result["schema_version"] = FINAL_RESULT_SCHEMA_VERSION
-        result["pipeline_status"] = "complete"
         result["final_segmentation"] = {
             "schema_version": 1,
             "role": "visualization_only",
@@ -2470,6 +2707,18 @@ def analyze_windows(
         ),
     }
     result["confidence"] = round(score["overall"], 4)
+    result["final_segmentation"] = {
+        "schema_version": 1,
+        "role": "optional_visualization_only",
+        "status": "not_requested",
+        "changes_temporal_selection": False,
+        "selected_window_id": window["window_id"],
+        "frame_results": [],
+        "warning": (
+            "Temporal selection is complete. SAM3 masks may be generated "
+            "later for visualization but are not required."
+        ),
+    }
     result["best_segment"] = {
         "window_id": window["window_id"],
         "cam": window["cam"],
@@ -2478,6 +2727,18 @@ def analyze_windows(
         "requested_video_ratio": window["requested_video_ratio"],
         "actual_sampled_frame_ratio": window["actual_sampled_frame_ratio"],
         "actual_frame_span_ratio": window["actual_frame_span_ratio"],
+        "window_construction": window.get(
+            "window_construction", "dense_fixed_ratio"
+        ),
+        "duration_adjustment": window.get(
+            "duration_adjustment", "fixed_ratio_baseline"
+        ),
+        "padding_sampled_frames_before": int(
+            window.get("padding_sampled_frames_before", 0)
+        ),
+        "padding_sampled_frames_after": int(
+            window.get("padding_sampled_frames_after", 0)
+        ),
         "captured_occurrence": {
             key: score[key]
             for key in (
@@ -2540,8 +2801,10 @@ def analyze_windows(
         },
         "confidence": round(score["overall"], 4),
         "reason_selected": (
-            "Highest-scoring identity-verified dense continuous 20%-30% Qwen "
-            "window. SAM3 is used only for final visualization."
+            "Highest-scoring identity-verified continuous 20%-30% Qwen "
+            "window fitted to the detected occurrence. Short occurrences are "
+            "extended using the nearest surrounding frames. SAM3 is optional "
+            "and does not affect temporal selection."
         ),
         "recommended_sam_prompt": (
             f"Segment the {identity.get('object_identity', metadata['target_object'])} "
@@ -2694,9 +2957,16 @@ def render_selected_contact_sheet(
 
     windows = {
         str(item["window_id"]): item
-        for item in [*all_windows(temporal_index), *dense_sliding_windows(temporal_index)]
+        for item in [
+            *all_windows(temporal_index),
+            *temporal_candidate_windows(
+                temporal_index, list(evidence_map.values())
+            ),
+        ]
     }
-    window = windows[str(best["window_id"])]
+    window = windows.get(str(best["window_id"]))
+    if window is None:
+        window = materialize_selected_window(best, temporal_index)
     if "contact_sheet" not in window:
         items = selected_mask_display_items(
             window,
@@ -2987,9 +3257,13 @@ def render_result(
         str(window["window_id"]): window
         for window in [
             *all_windows(temporal_index),
-            *dense_sliding_windows(temporal_index),
+            *temporal_candidate_windows(temporal_index, evidence),
         ]
     }
+    if best and str(best["window_id"]) not in windows_by_id:
+        windows_by_id[str(best["window_id"])] = materialize_selected_window(
+            best, temporal_index
+        )
     selected_items: list[Mapping[str, Any]] = []
     selected_window: Mapping[str, Any] | None = None
     if best:
@@ -3157,6 +3431,16 @@ def process_case(
         evidence = read_json(evidence_path)
         verification_path = work_case / "qwen_window_verifications.json"
         window_verifications = read_json(verification_path)
+        if any(
+            item.get("verification_schema_version")
+            != WINDOW_VERIFICATION_SCHEMA_VERSION
+            for item in window_verifications.values()
+        ):
+            raise RuntimeError(
+                "Cached window verifications predate occurrence-centered "
+                "selection. Rerun this case normally (without --rescore-only) "
+                "once. Existing frame evidence will still be reused."
+            )
         previous = read_json(result_path) if result_path.exists() else {}
         result = analyze_windows(
             anchor["metadata"],

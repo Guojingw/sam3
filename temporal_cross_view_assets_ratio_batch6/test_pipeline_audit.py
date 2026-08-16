@@ -58,6 +58,25 @@ class PipelineAuditTests(unittest.TestCase):
                 pipeline_audit.classify(case)[0], "complete_uncertain"
             )
 
+    def test_schema14_qwen_selection_is_complete_without_sam3(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            case = self.write_result(
+                Path(tmp),
+                {
+                    "schema_version": 14,
+                    "status": "success",
+                    "pipeline_status": "complete",
+                    "best_segment": {"window_id": "cam01_occurrence_000_adaptive"},
+                    "final_segmentation": {
+                        "status": "not_requested",
+                        "frame_results": [],
+                    },
+                },
+            )
+            stage, detail = pipeline_audit.classify(case)
+            self.assertEqual(stage, "complete")
+            self.assertIn("sam3_optional=true", detail)
+
 
 if __name__ == "__main__":
     unittest.main()

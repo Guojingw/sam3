@@ -21,7 +21,7 @@ import qwen_temporal_runner as temporal
 
 
 FINAL_SEGMENTATION_SCHEMA_VERSION = 1
-RESULT_SCHEMA_VERSION = 13
+RESULT_SCHEMA_VERSION = 14
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -265,7 +265,10 @@ def window_record(
             *temporal.dense_sliding_windows(temporal_index),
         ]
     }
-    return windows[str(selection["window_id"])]
+    window_id = str(selection["window_id"])
+    if window_id in windows:
+        return windows[window_id]
+    return temporal.materialize_selected_window(selection, temporal_index)
 
 
 def verified_box_map(

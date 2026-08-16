@@ -165,7 +165,7 @@ class FinalSegmentationTests(unittest.TestCase):
                 index,
                 catalog,
             )
-            self.assertEqual(updated["schema_version"], 13)
+            self.assertEqual(updated["schema_version"], 14)
             self.assertEqual(updated["status"], "success")
             self.assertEqual(updated["best_segment"], expected)
             self.assertEqual(
@@ -213,7 +213,7 @@ class FinalSegmentationTests(unittest.TestCase):
             self.assertEqual(panel.getpixel((10, 40)), (100, 100, 100))
             self.assertNotEqual(panel.getpixel((60, 60)), (100, 100, 100))
 
-    def test_schema13_renderer_uses_only_selected_masks(self) -> None:
+    def test_schema14_renderer_uses_only_selected_masks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             case, work, index, catalog, evidence, result = temporal_fixture(Path(tmp))
             result = segmenter.finalize_result(

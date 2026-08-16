@@ -53,7 +53,7 @@ class TemporalSelectionTests(unittest.TestCase):
             (item["cam"], item["frame_id"]): item for item in evidence
         }
         output = {}
-        for window in runner.dense_sliding_windows(self.index):
+        for window in runner.temporal_candidate_windows(self.index, evidence):
             items = [
                 evidence_map[(window["cam"], frame_id)]
                 for frame_id in window["frame_ids"]
@@ -111,14 +111,17 @@ class TemporalSelectionTests(unittest.TestCase):
         self.assertEqual(result["status"], "success")
         best = result["best_segment"]
         self.assertEqual(result["qwen_temporal_selection"], best)
+        self.assertEqual(result["pipeline_status"], "complete")
+        self.assertEqual(result["schema_version"], 14)
         self.assertEqual(
-            result["pipeline_status"], "awaiting_final_sam3_segmentation"
+            result["final_segmentation"]["status"], "not_requested"
         )
         self.assertLessEqual(best["start_frame"], 1200)
         self.assertGreaterEqual(best["end_frame"], 2400)
         self.assertEqual(
             best["captured_occurrence"]["captured_occurrence_fraction"], 1.0
         )
+        self.assertEqual(best["duration_adjustment"], "exact_occurrence")
 
     def test_short_occurrence_selects_nearest_twenty_percent_window(self) -> None:
         evidence = synthetic_evidence(1200, 1800)
@@ -137,6 +140,55 @@ class TemporalSelectionTests(unittest.TestCase):
         self.assertEqual(
             best["captured_occurrence"]["captured_occurrence_fraction"], 1.0
         )
+        self.assertEqual(best["duration_adjustment"], "nearest_padding")
+        self.assertEqual(
+            best["window_construction"],
+            "occurrence_centered_nearest_padding",
+        )
+
+    def test_short_occurrence_at_start_moves_all_padding_after_it(self) -> None:
+        evidence = synthetic_evidence(0, 300)
+        adaptive = runner.occurrence_centered_windows(self.index, evidence)[0]
+        self.assertEqual(adaptive["start_frame"], 0)
+        self.assertEqual(adaptive["padding_sampled_frames_before"], 0)
+        self.assertGreater(adaptive["padding_sampled_frames_after"], 0)
+        self.assertGreaterEqual(adaptive["actual_sampled_frame_ratio"], 0.20)
+
+    def test_long_occurrence_is_capped_at_thirty_percent(self) -> None:
+        evidence = synthetic_evidence(600, 3300)
+        adaptive = runner.occurrence_centered_windows(self.index, evidence)[0]
+        self.assertEqual(
+            adaptive["duration_adjustment"], "strongest_continuous_slice"
+        )
+        self.assertLessEqual(adaptive["actual_sampled_frame_ratio"], 0.30)
+
+    def test_nearest_padding_does_not_cross_camera_discontinuity(self) -> None:
+        frame_ids = [0, 1, 2, 3, 4, 100, 101, 102, 103, 104]
+        index = {
+            "cameras": {
+                "cam01": {
+                    "windows": [{"frame_ids": frame_ids}],
+                    "continuity_split_threshold": 2,
+                }
+            }
+        }
+        evidence = []
+        for frame_id in frame_ids:
+            present = frame_id == 101
+            evidence.append(
+                {
+                    "cam": "cam01",
+                    "frame_id": frame_id,
+                    "model_presence": "confirmed" if present else "absent",
+                    "bbox_xyxy_normalized": [0.2, 0.2, 0.4, 0.4] if present else None,
+                    "visibility": 0.9 if present else 0.0,
+                    "identity_confidence": 0.9 if present else 0.0,
+                    "evidence_score": 0.9 if present else 0.0,
+                }
+            )
+        adaptive = runner.occurrence_centered_windows(index, evidence)[0]
+        self.assertGreaterEqual(adaptive["start_frame"], 100)
+        self.assertNotIn(4, adaptive["frame_ids"])
 
     def test_single_unverified_glimpse_remains_uncertain(self) -> None:
         evidence = synthetic_evidence(1200, 1200)
@@ -148,7 +200,7 @@ class TemporalSelectionTests(unittest.TestCase):
             self.verifications(evidence),
         )
         self.assertEqual(result["status"], "uncertain")
-        self.assertEqual(result["schema_version"], 13)
+        self.assertEqual(result["schema_version"], 14)
         self.assertEqual(result["pipeline_status"], "complete")
         self.assertEqual(
             result["final_segmentation"]["role"], "visualization_only"
@@ -159,9 +211,8 @@ class TemporalSelectionTests(unittest.TestCase):
         evidence = synthetic_evidence(1200, 1200)
         containing = next(
             window
-            for window in runner.dense_sliding_windows(self.index)
+            for window in runner.occurrence_centered_windows(self.index, evidence)
             if 1200 in window["frame_ids"]
-            and window["requested_video_ratio"] == 0.20
         )
         verification = {
             "verification_schema_version": runner.WINDOW_VERIFICATION_SCHEMA_VERSION,

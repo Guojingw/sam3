@@ -28,7 +28,7 @@ def classify(case_dir: Path) -> tuple[str, str]:
     pipeline = str(result.get("pipeline_status", ""))
     best = result.get("qwen_temporal_selection") or result.get("best_segment")
 
-    if schema == 13 and pipeline == "complete":
+    if schema >= 13 and pipeline == "complete":
         segmented = int(
             (result.get("final_segmentation") or {}).get(
                 "segmented_frame_count", 0
@@ -36,7 +36,16 @@ def classify(case_dir: Path) -> tuple[str, str]:
             or 0
         )
         if status == "success":
-            return "complete", f"schema=13 segmented_frames={segmented}"
+            temporal_only = (
+                (result.get("final_segmentation") or {}).get("status")
+                == "not_requested"
+            )
+            return (
+                "complete",
+                f"schema={schema} temporal_selection_complete "
+                f"sam3_optional={str(temporal_only).lower()} "
+                f"segmented_frames={segmented}",
+            )
         return "complete_uncertain", "Qwen found no verified temporal window"
     if (
         schema == 11

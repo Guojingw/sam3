@@ -27,10 +27,13 @@ for case_dir in "$ASSETS"/*__*; do
     continue
   fi
   if ! jq -e '
-      .schema_version == 11 and
-      .pipeline_status == "awaiting_final_sam3_segmentation" and
       .status == "success" and
-      .best_segment != null
+      .best_segment != null and
+      ((.schema_version == 11 and
+        .pipeline_status == "awaiting_final_sam3_segmentation") or
+       (.schema_version >= 14 and
+        .pipeline_status == "complete" and
+        .final_segmentation.status == "not_requested"))
     ' "$result_path" >/dev/null 2>&1; then
     schema="$(jq -r '.schema_version // 0' "$result_path" 2>/dev/null || echo 0)"
     pipeline="$(jq -r '.pipeline_status // "legacy"' "$result_path" 2>/dev/null || echo unreadable)"
@@ -49,7 +52,7 @@ for case_dir in "$ASSETS"/*__*; do
 done
 
 if [[ $index -eq 0 ]]; then
-  echo "No selected schema-11 cases require final SAM3 masks."
+  echo "No selected cases requested optional SAM3 masks."
   exit 0
 fi
 
