@@ -33,7 +33,8 @@ for case_dir in "$ASSETS"/*__*; do
         .pipeline_status == "awaiting_final_sam3_segmentation") or
        (.schema_version >= 14 and
         .pipeline_status == "complete" and
-        .final_segmentation.status == "not_requested"))
+        ((.final_segmentation.status == "not_requested") or
+         ((.final_segmentation.schema_version // 0) < 2))))
     ' "$result_path" >/dev/null 2>&1; then
     schema="$(jq -r '.schema_version // 0' "$result_path" 2>/dev/null || echo 0)"
     pipeline="$(jq -r '.pipeline_status // "legacy"' "$result_path" 2>/dev/null || echo unreadable)"

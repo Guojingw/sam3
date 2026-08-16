@@ -36,13 +36,22 @@ window fields include `duration_adjustment`, `padding_sampled_frames_before`,
 ## Optional SAM3 visualization
 
 After a Qwen window is selected, SAM3 independently segments five representative
-frames from that one window. It first uses the source-derived object identity as
-a text prompt. A Qwen bbox is only a fallback when text produces no mask and is
-never used to rank time.
+frames from that one window. Qwen's independently verified target bbox is the
+required positive spatial prompt. SAM3 does not use a free text-only mask when
+multiple same-class instances may exist. A mask with insufficient overlap with
+the Qwen bbox is rejected instead of displaying the wrong instance. The nearest
+verified Qwen bbox is used for display frames without an exact verified bbox,
+and its source frame is recorded for audit.
 
 Without SAM3, `final_segmentation.status` is `not_requested`. This is a complete
 result, not a missing pipeline stage. If SAM3 is run later, it may populate
 display masks but must not change `qwen_temporal_selection`.
+
+Final segmentation schema 2 records
+`spatial_policy=qwen_verified_box_required`, each frame's
+`qwen_expected_box_xyxy_normalized`, and `qwen_box_source_frame`. Existing
+schema-1 masks are automatically eligible for regeneration by the parallel
+SAM3 submission script.
 
 - `qwen_temporal_selection`: the time decision.
 - `final_segmentation.role`: always `visualization_only`.

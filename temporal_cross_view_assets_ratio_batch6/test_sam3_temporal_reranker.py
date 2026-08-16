@@ -104,7 +104,17 @@ def temporal_fixture(root: Path):
         "target_object": "CPR dummy",
         "best_segment": dict(selection),
         "qwen_temporal_selection": dict(selection),
-        "window_verifications": {},
+        "window_verifications": {
+            window["window_id"]: {
+                "frame_results": [
+                    {
+                        "frame_id": 60,
+                        "target_present": True,
+                        "bbox_xyxy_normalized": [0.3, 0.3, 0.8, 0.8],
+                    }
+                ]
+            }
+        },
         "global_challenger_comparison": None,
         "rejected_segments": [],
         "uncertainty": "",
@@ -118,22 +128,24 @@ class FinalSegmentationTests(unittest.TestCase):
         mask[2:8, 5:15] = True
         self.assertEqual(segmenter.mask_bbox(mask), [0.25, 0.2, 0.75, 0.8])
 
-    def test_semantic_probability_dominates_wrong_box_prior(self) -> None:
-        semantic = np.zeros((20, 20), dtype=bool)
-        semantic[2:9, 2:9] = True
-        near_wrong_box = np.zeros((20, 20), dtype=bool)
-        near_wrong_box[12:18, 12:18] = True
+    def test_qwen_box_rejects_higher_probability_wrong_instance(self) -> None:
+        wrong_instance = np.zeros((20, 20), dtype=bool)
+        wrong_instance[2:9, 2:9] = True
+        qwen_instance = np.zeros((20, 20), dtype=bool)
+        qwen_instance[12:18, 12:18] = True
         selected = segmenter.choose_final_mask(
             {
                 "out_obj_ids": np.array([1, 2]),
-                "out_binary_masks": np.stack([semantic, near_wrong_box]),
+                "out_binary_masks": np.stack([wrong_instance, qwen_instance]),
                 "out_probs": np.array([0.90, 0.60]),
             },
             [0.6, 0.6, 0.9, 0.9],
+            require_spatial_match=True,
         )
-        self.assertEqual(selected["object_id"], 1)
+        self.assertEqual(selected["object_id"], 2)
+        self.assertTrue(selected["qwen_spatial_match"])
 
-    def test_text_mask_is_not_replaced_by_box_prompt(self) -> None:
+    def test_qwen_box_is_primary_prompt_and_text_is_not_used(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             frame = Path(tmp) / "frame.jpg"
             Image.new("RGB", (80, 60), "gray").save(frame)
@@ -143,15 +155,30 @@ class FinalSegmentationTests(unittest.TestCase):
                 frame,
                 Path(tmp) / "session",
                 "CPR dummy",
-                [0.0, 0.0, 0.2, 0.2],
+                [0.3, 0.3, 0.8, 0.8],
             )
             self.assertIsNotNone(selected)
-            self.assertEqual(method, "semantic_text")
+            self.assertEqual(method, "qwen_verified_box")
             add_prompts = [
                 item for item in predictor.requests if item["type"] == "add_prompt"
             ]
             self.assertEqual(len(add_prompts), 1)
-            self.assertNotIn("bounding_boxes", add_prompts[0])
+            self.assertIn("bounding_boxes", add_prompts[0])
+            self.assertNotIn("text", add_prompts[0])
+
+    def test_mask_without_qwen_overlap_is_rejected(self) -> None:
+        wrong = np.zeros((20, 20), dtype=bool)
+        wrong[1:5, 1:5] = True
+        selected = segmenter.choose_final_mask(
+            {
+                "out_obj_ids": np.array([1]),
+                "out_binary_masks": np.stack([wrong]),
+                "out_probs": np.array([0.99]),
+            },
+            [0.6, 0.6, 0.9, 0.9],
+            require_spatial_match=True,
+        )
+        self.assertIsNone(selected)
 
     def test_final_segmentation_never_changes_temporal_selection(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

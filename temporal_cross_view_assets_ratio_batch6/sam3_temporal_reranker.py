@@ -20,7 +20,7 @@ from PIL import Image
 import qwen_temporal_runner as temporal
 
 
-FINAL_SEGMENTATION_SCHEMA_VERSION = 1
+FINAL_SEGMENTATION_SCHEMA_VERSION = 2
 RESULT_SCHEMA_VERSION = 14
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
@@ -115,9 +115,11 @@ def output_arrays(
 
 
 def choose_final_mask(
-    outputs: Mapping[str, Any], expected_box: Sequence[float] | None
+    outputs: Mapping[str, Any],
+    expected_box: Sequence[float] | None,
+    require_spatial_match: bool = False,
 ) -> dict[str, Any] | None:
-    """Choose a semantic SAM mask; Qwen geometry is only a weak prior."""
+    """Choose a mask that agrees with Qwen's verified instance geometry."""
     object_ids, masks, probabilities = output_arrays(outputs)
     choices = []
     for index, object_id in enumerate(object_ids.astype(int)):
@@ -131,9 +133,15 @@ def choose_final_mask(
         probability = float(probabilities[index]) if index < len(probabilities) else 0.0
         overlap = box_iou(box, expected_box) if expected_box else 0.0
         coverage = reference_coverage(box, expected_box) if expected_box else 0.0
-        # Semantic text owns mask identity. The approximate Qwen box only
-        # breaks close ties and never acts as the primary SAM3 prompt.
-        score = 0.95 * probability + 0.03 * coverage + 0.02 * overlap
+        spatial_match = bool(
+            expected_box
+            and (coverage >= 0.15 or overlap >= 0.10)
+        )
+        if require_spatial_match and not spatial_match:
+            continue
+        # Qwen owns instance identity and location. SAM3 probability only
+        # breaks ties between masks that already agree spatially.
+        score = 0.55 * coverage + 0.35 * overlap + 0.10 * probability
         choices.append(
             {
                 "object_id": int(object_id),
@@ -143,6 +151,7 @@ def choose_final_mask(
                 "semantic_probability": probability,
                 "expected_box_iou": overlap,
                 "expected_box_coverage": coverage,
+                "qwen_spatial_match": spatial_match,
                 "selection_score": score,
             }
         )
@@ -206,29 +215,23 @@ def segment_final_frame(
     object_identity: str,
     expected_box: Sequence[float] | None,
 ) -> tuple[dict[str, Any] | None, str]:
-    text_outputs = run_single_frame_prompt(
-        predictor,
-        frame_path,
-        frame_dir / "text",
-        object_identity,
-        None,
-    )
-    selected = choose_final_mask(text_outputs, expected_box)
-    if selected:
-        return selected, "semantic_text"
     if expected_box is None:
-        return selected, "semantic_text_low_confidence"
+        return None, "missing_qwen_verified_box"
     box_outputs = run_single_frame_prompt(
         predictor,
         frame_path,
-        frame_dir / "box",
-        object_identity,
-        expand_box(expected_box),
+        frame_dir / "qwen_box",
+        None,
+        expand_box(expected_box, factor=1.20),
     )
-    box_selected = choose_final_mask(box_outputs, expected_box)
+    box_selected = choose_final_mask(
+        box_outputs,
+        expected_box,
+        require_spatial_match=True,
+    )
     if box_selected is None:
-        return selected, "semantic_text_low_confidence"
-    return box_selected, "semantic_text_plus_box"
+        return None, "qwen_verified_box_no_spatial_mask"
+    return box_selected, "qwen_verified_box"
 
 
 def selected_window(
@@ -299,6 +302,15 @@ def nearest_box(
     return list(boxes[nearest_id])
 
 
+def nearest_box_with_source(
+    boxes: Mapping[int, Sequence[float]], frame_id: int
+) -> tuple[list[float] | None, int | None]:
+    if not boxes:
+        return None, None
+    nearest_id = min(boxes, key=lambda value: abs(int(value) - frame_id))
+    return list(boxes[nearest_id]), int(nearest_id)
+
+
 def save_mask(case_dir: Path, cam: str, frame_id: int, mask: np.ndarray) -> str:
     output_dir = case_dir / "analysis_outputs" / "final_sam3_masks"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -344,7 +356,9 @@ def finalize_result(
             f"[final mask {position}/{len(display_ids)}] {cam} frame {frame_id}",
             flush=True,
         )
-        expected = nearest_box(boxes, int(frame_id))
+        expected, expected_source_frame = nearest_box_with_source(
+            boxes, int(frame_id)
+        )
         selected, method = segment_final_frame(
             predictor,
             catalog[(cam, int(frame_id))],
@@ -359,6 +373,8 @@ def finalize_result(
                     "frame_id": int(frame_id),
                     "target_present": False,
                     "method": method,
+                    "qwen_expected_box_xyxy_normalized": expected,
+                    "qwen_box_source_frame": expected_source_frame,
                     "mask_path": None,
                 }
             )
@@ -372,6 +388,8 @@ def finalize_result(
                 "frame_id": int(frame_id),
                 "target_present": True,
                 "method": method,
+                "qwen_expected_box_xyxy_normalized": expected,
+                "qwen_box_source_frame": expected_source_frame,
                 "mask_path": mask_path,
                 **selected,
             }
@@ -386,6 +404,8 @@ def finalize_result(
     result["final_segmentation"] = {
         "schema_version": FINAL_SEGMENTATION_SCHEMA_VERSION,
         "role": "visualization_only",
+        "spatial_policy": "qwen_verified_box_required",
+        "sam3_changes_temporal_selection": False,
         "changes_temporal_selection": False,
         "object_identity": identity,
         "selected_window_id": selection["window_id"],
