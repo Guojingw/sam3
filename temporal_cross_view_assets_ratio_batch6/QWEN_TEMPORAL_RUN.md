@@ -20,6 +20,9 @@ only adds display masks.
    run and record its ratio shortfall rather than returning no window.
 4. Dense 20%, 25%, and 30% sliding windows remain comparison baselines. Qwen
    independently verifies the strongest occurrence-centered and dense windows.
+   If an initial bbox fails crop identity, every verified candidate window is
+   eligible for bounded nine-tile full-frame spatial rescue rather than only
+   the first three windows.
 5. Deterministic scoring selects the final continuous window. The result is
    saved in both `best_segment` and `qwen_temporal_selection`.
 6. A brief occurrence may be accepted from one independently crop-verified
