@@ -730,6 +730,102 @@ class TemporalSelectionTests(unittest.TestCase):
             ["coarse", "fine"],
         )
 
+    def test_weak_tile_candidates_prefers_best_scale_candidate(self) -> None:
+        raw = [
+            {
+                "frame_id": 30,
+                "response": {
+                    "attempts": [
+                        {
+                            "tile_scale": "coarse",
+                            "response": {
+                                "search": {
+                                    "best_candidate": {
+                                        "tile_id": "r0c0",
+                                        "bbox_xyxy_normalized_within_tile": [
+                                            0.2,
+                                            0.2,
+                                            0.4,
+                                            0.4,
+                                        ],
+                                        "identity_confidence": 0.6,
+                                    }
+                                }
+                            },
+                        },
+                        {
+                            "tile_scale": "fine",
+                            "response": {
+                                "search": {
+                                    "best_candidate": {
+                                        "tile_id": "r1c1",
+                                        "bbox_xyxy_normalized_within_tile": [
+                                            0.25,
+                                            0.25,
+                                            0.5,
+                                            0.5,
+                                        ],
+                                        "identity_confidence": 0.8,
+                                    }
+                                }
+                            },
+                        },
+                    ]
+                },
+            }
+        ]
+        candidates = runner.weak_tile_candidates(raw)
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["tile_scale"], "fine")
+        for actual, expected in zip(
+            candidates[0]["bbox_xyxy_normalized"], [0.4, 0.4, 0.5, 0.5]
+        ):
+            self.assertAlmostEqual(actual, expected)
+
+    def test_temporal_consensus_requires_two_localized_frames(self) -> None:
+        response = {
+            "same_object_type": True,
+            "candidate_crops_collectively_verifiable": True,
+            "matched_visible_cues_across_frames": ["round rim", "white body"],
+            "conflicting_visible_cues": [],
+            "sequence_identity_confidence": 0.92,
+            "frames": [
+                {
+                    "frame_id": 30,
+                    "same_target_instance": True,
+                    "bbox_xyxy_normalized": [0.2, 0.2, 0.3, 0.3],
+                    "object_completeness": 0.7,
+                    "bbox_tightness": 0.8,
+                    "object_fill_fraction_in_bbox": 0.7,
+                }
+            ],
+        }
+        self.assertFalse(
+            runner.temporal_consensus_check(response)[
+                "temporal_consensus_passed"
+            ]
+        )
+        response["frames"].append(dict(response["frames"][0]))
+        self.assertFalse(
+            runner.temporal_consensus_check(response)[
+                "temporal_consensus_passed"
+            ]
+        )
+        response["frames"].pop()
+        response["frames"].append(
+            {
+                "frame_id": 60,
+                "same_target_instance": True,
+                "bbox_xyxy_normalized": [0.22, 0.2, 0.32, 0.3],
+                "object_completeness": 0.6,
+                "bbox_tightness": 0.75,
+                "object_fill_fraction_in_bbox": 0.65,
+            }
+        )
+        checked = runner.temporal_consensus_check(response)
+        self.assertTrue(checked["temporal_consensus_passed"])
+        self.assertEqual(len(checked["accepted_frames"]), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -22,7 +22,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 CASE_GLOB = "*__*"
 EVIDENCE_SCHEMA_VERSION = 5
-WINDOW_VERIFICATION_SCHEMA_VERSION = 12
+WINDOW_VERIFICATION_SCHEMA_VERSION = 13
 RESULT_SCHEMA_VERSION = 14
 FINAL_RESULT_SCHEMA_VERSION = 14
 CONFIRMED_THRESHOLD = 0.50
@@ -36,6 +36,8 @@ MAX_WINDOWS_TO_VERIFY = 8
 MAX_REFINEMENT_SEEDS_PER_CAMERA = 6
 MAX_TILE_RESCUE_WINDOWS = MAX_WINDOWS_TO_VERIFY
 MAX_TILE_RESCUE_FRAMES_PER_WINDOW = 3
+TEMPORAL_CONSENSUS_CONFIDENCE = 0.85
+TEMPORAL_CONSENSUS_MIN_FRAMES = 2
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
 FRAME_ID_RE = re.compile(r"(\d+)(?!.*\d)")
 
@@ -1143,6 +1145,205 @@ def tile_rescue_frame(
                 "attempts": attempts,
             }
     return None, {"selected_tile_scale": None, "attempts": attempts}
+
+
+def weak_tile_candidates(
+    tile_rescue_raw: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Recover one localized-but-unverified candidate per rescue frame."""
+    recovered: list[dict[str, Any]] = []
+    for frame_entry in tile_rescue_raw:
+        try:
+            frame_id = int(frame_entry["frame_id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        wrapper = frame_entry.get("response", {})
+        attempts = wrapper.get("attempts", []) if isinstance(wrapper, Mapping) else []
+        frame_candidates: list[dict[str, Any]] = []
+        for attempt in attempts:
+            if not isinstance(attempt, Mapping):
+                continue
+            tile_scale = str(attempt.get("tile_scale", ""))
+            raw = attempt.get("response", {})
+            if not isinstance(raw, Mapping):
+                continue
+            search = raw.get("search", {})
+            candidate = (
+                search.get("best_candidate")
+                if isinstance(search, Mapping)
+                else None
+            )
+            if not isinstance(candidate, Mapping):
+                continue
+            tile_id = str(candidate.get("tile_id", ""))
+            tile_map = dict(spatial_tile_boxes(tile_scale))
+            if tile_id not in tile_map:
+                continue
+            localization = raw.get("localization", {})
+            local_box = None
+            if isinstance(localization, Mapping):
+                local_box = normalized_box(
+                    localization.get("bbox_xyxy_normalized")
+                )
+            if local_box is None:
+                local_box = normalized_box(
+                    candidate.get("bbox_xyxy_normalized_within_tile")
+                )
+            full_box = map_tile_box_to_frame(tile_map[tile_id], local_box)
+            if full_box is None:
+                continue
+            confidence = bounded_score(candidate.get("identity_confidence"))
+            frame_candidates.append(
+                {
+                    "frame_id": frame_id,
+                    "bbox_xyxy_normalized": full_box,
+                    "tile_scale": tile_scale,
+                    "tile_id": tile_id,
+                    "preliminary_identity_confidence": confidence,
+                }
+            )
+        if frame_candidates:
+            recovered.append(
+                max(
+                    frame_candidates,
+                    key=lambda item: (
+                        float(item["preliminary_identity_confidence"]),
+                        item["tile_scale"] == "fine",
+                    ),
+                )
+            )
+    return recovered
+
+
+def temporal_consensus_check(
+    raw: Mapping[str, Any],
+    expected_frame_ids: set[int] | None = None,
+) -> dict[str, Any]:
+    """Apply strict deterministic gates to a multi-frame identity response."""
+    cues = normalize_string_list(raw.get("matched_visible_cues_across_frames"))
+    conflicts = normalize_string_list(raw.get("conflicting_visible_cues"))
+    confidence = bounded_score(raw.get("sequence_identity_confidence"))
+    returned_frames = raw.get("frames", [])
+    accepted_by_frame: dict[int, dict[str, Any]] = {}
+    if isinstance(returned_frames, list):
+        for item in returned_frames:
+            if not isinstance(item, Mapping) or item.get("frame_id") is None:
+                continue
+            try:
+                frame_id = int(item["frame_id"])
+            except (TypeError, ValueError):
+                continue
+            if expected_frame_ids is not None and frame_id not in expected_frame_ids:
+                continue
+            box = normalized_box(item.get("bbox_xyxy_normalized"))
+            metrics = presentation_metrics(item, box)
+            if model_bool(item.get("same_target_instance")) and metrics[
+                "localization_check_passed"
+            ]:
+                accepted_by_frame[frame_id] = {
+                    "frame_id": frame_id,
+                    "bbox_xyxy_normalized": box,
+                    **metrics,
+                }
+    accepted_frames = list(accepted_by_frame.values())
+    passed = bool(
+        model_bool(raw.get("same_object_type"))
+        and model_bool(raw.get("candidate_crops_collectively_verifiable"))
+        and confidence >= TEMPORAL_CONSENSUS_CONFIDENCE
+        and len(cues) >= 2
+        and not conflicts
+        and len(accepted_frames) >= TEMPORAL_CONSENSUS_MIN_FRAMES
+    )
+    return {
+        "temporal_consensus_passed": passed,
+        "identity_confidence": confidence if passed else 0.0,
+        "matched_visible_cues": cues,
+        "conflicting_visible_cues": conflicts,
+        "accepted_frames": accepted_frames if passed else [],
+    }
+
+
+def verify_temporal_tile_consensus(
+    qwen: "Qwen",
+    anchor: Mapping[str, Any],
+    identity: Mapping[str, Any],
+    catalog: Mapping[tuple[str, int], Path],
+    work_case: Path,
+    window: Mapping[str, Any],
+    tile_rescue_raw: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, Any], Any]:
+    """Jointly verify weak crops whose identity cues are split across frames."""
+    candidates = weak_tile_candidates(tile_rescue_raw)
+    if len(candidates) < TEMPORAL_CONSENSUS_MIN_FRAMES:
+        return temporal_consensus_check({}), {
+            "status": "insufficient_weak_candidates",
+            "candidate_count": len(candidates),
+        }
+    panels = [
+        make_candidate_identity_panel(
+            catalog[(str(window["cam"]), int(item["frame_id"]))],
+            anchor["isolated_path"],
+            item["bbox_xyxy_normalized"],
+            work_case,
+            str(window["window_id"]),
+            int(item["frame_id"]),
+            variant=f"temporal_{item['tile_scale']}_{item['tile_id']}",
+        )
+        for item in candidates
+    ]
+    image_map = [
+        {
+            "image_number": index + 1,
+            "frame_id": item["frame_id"],
+            "proposed_bbox_xyxy_normalized": item["bbox_xyxy_normalized"],
+        }
+        for index, item in enumerate(candidates)
+    ]
+    prompt = f"""
+Jointly verify weak distant or partially occluded candidates from ONE continuous
+third-person window. Every image contains SOURCE MASK RGB, third-person
+context, and one enlarged proposed object. Mapping:
+{json.dumps(image_map, ensure_ascii=False)}
+
+Authoritative source identity:
+{json.dumps(identity, ensure_ascii=False)}
+
+No single crop was sufficient for strict identity verification. Determine
+whether at least two frames collectively show the same target object type.
+Physical identity cues may be distributed across frames, but color alone,
+shared scene location, or repeated false detections are never sufficient.
+Require at least two distinct visible structural/material/part cues across the
+sequence and no conflicting cue. Reject a sequence that mixes different
+objects. For every accepted frame, return the proposed bbox and independently
+score its completeness, tightness, and object fill. Do not improve these scores
+merely because other frames look convincing.
+
+Return JSON only:
+{{
+  "same_object_type": false,
+  "candidate_crops_collectively_verifiable": false,
+  "matched_visible_cues_across_frames": [],
+  "conflicting_visible_cues": [],
+  "sequence_identity_confidence": 0.0,
+  "frames": [
+    {{
+      "frame_id": {candidates[0]['frame_id']},
+      "same_target_instance": false,
+      "bbox_xyxy_normalized": null,
+      "object_completeness": 0.0,
+      "bbox_tightness": 0.0,
+      "object_fill_fraction_in_bbox": 0.0
+    }}
+  ]
+}}
+Return exactly one frames entry for every mapped frame ID.
+"""
+    raw = qwen.ask(panels, prompt)
+    if not isinstance(raw, Mapping):
+        return temporal_consensus_check({}), raw
+    return temporal_consensus_check(
+        raw, {int(item["frame_id"]) for item in candidates}
+    ), raw
 
 
 class Qwen:
@@ -2365,6 +2566,8 @@ Return JSON only with exactly one entry per mapped frame:
             )
         positives = [item for item in frame_results if item["target_present"]]
         tile_rescue_raw: list[dict[str, Any]] = []
+        temporal_consensus_raw: Any = None
+        temporal_consensus_summary = temporal_consensus_check({})
         if len(positives) < 2 and window_id in tile_rescue_window_ids:
             positions = {
                 frame_id: index for index, frame_id in enumerate(target_frame_ids)
@@ -2416,6 +2619,50 @@ Return JSON only with exactly one entry per mapped frame:
             positives = [
                 item for item in frame_results if item["target_present"]
             ]
+        if len(positives) < 2 and len(tile_rescue_raw) >= 2:
+            print(f"[temporal consensus] {window_id}", flush=True)
+            temporal_consensus_summary, temporal_consensus_raw = (
+                verify_temporal_tile_consensus(
+                    qwen,
+                    anchor,
+                    identity,
+                    catalog,
+                    work_case,
+                    window,
+                    tile_rescue_raw,
+                )
+            )
+            if temporal_consensus_summary["temporal_consensus_passed"]:
+                accepted_by_frame = {
+                    int(item["frame_id"]): item
+                    for item in temporal_consensus_summary["accepted_frames"]
+                }
+                for item in frame_results:
+                    accepted = accepted_by_frame.get(int(item["frame_id"]))
+                    if accepted is None:
+                        continue
+                    item.update(accepted)
+                    item.update(
+                        {
+                            "presence": "confirmed",
+                            "target_present": True,
+                            "localization_method": "multiframe_tile_consensus",
+                            "identity_verification_mode": "temporal_consensus",
+                            "identity_check_passed": True,
+                            "same_object_type": True,
+                            "candidate_crop_is_visually_verifiable": True,
+                            "identity_confidence": temporal_consensus_summary[
+                                "identity_confidence"
+                            ],
+                            "matched_visible_cues": temporal_consensus_summary[
+                                "matched_visible_cues"
+                            ],
+                            "conflicting_visible_cues": [],
+                        }
+                    )
+                positives = [
+                    item for item in frame_results if item["target_present"]
+                ]
         representative = max(
             positives,
             key=lambda item: float(item["identity_confidence"]),
@@ -2424,8 +2671,16 @@ Return JSON only with exactly one entry per mapped frame:
         strong_positives = [
             item
             for item in positives
-            if float(item.get("identity_confidence", 0.0))
-            >= STRONG_SINGLE_MATCH_CONFIDENCE
+            if (
+                float(item.get("identity_confidence", 0.0))
+                >= STRONG_SINGLE_MATCH_CONFIDENCE
+                or (
+                    item.get("identity_verification_mode")
+                    == "temporal_consensus"
+                    and float(item.get("identity_confidence", 0.0))
+                    >= TEMPORAL_CONSENSUS_CONFIDENCE
+                )
+            )
             and len(normalize_string_list(item.get("matched_visible_cues"))) >= 2
             and not normalize_string_list(item.get("conflicting_visible_cues"))
         ]
@@ -2479,6 +2734,8 @@ Return JSON only with exactly one entry per mapped frame:
             "raw_full_frame_response": raw,
             "raw_candidate_crop_response": crop_raw,
             "raw_tile_rescue_responses": tile_rescue_raw,
+            "temporal_consensus": temporal_consensus_summary,
+            "raw_temporal_consensus_response": temporal_consensus_raw,
         }
         write_json(cache_path, cached)
     return cached

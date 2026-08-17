@@ -26,6 +26,10 @@ only adds display masks.
    if strict crop verification still fails, it searches finer 40%-frame tiles
    and samples up to three separated frames from that window. This improves
    distant and partially visible targets without lowering identity thresholds.
+   When those individual crops remain incomplete, one final temporal-consensus
+   check may combine identity cues across the rescued frames. It requires at
+   least two independently well-localized frames, two collective physical cues,
+   confidence of at least 0.85, and no conflicting cue.
 5. Deterministic scoring selects the final continuous window. The result is
    saved in both `best_segment` and `qwen_temporal_selection`.
 6. A brief occurrence may be accepted from one independently crop-verified
@@ -124,7 +128,7 @@ old verification cache is automatically replaced. For one case:
   --case '<case_id>'
 ```
 
-After schema-12 window verifications exist, later scoring-only code changes can
+After schema-13 window verifications exist, later scoring-only code changes can
 be applied with `--rescore-only`. SAM3 submission is optional:
 
 ```bash
