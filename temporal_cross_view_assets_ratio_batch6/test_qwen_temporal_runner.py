@@ -6,6 +6,7 @@ from __future__ import annotations
 import unittest
 import tempfile
 from pathlib import Path
+from unittest import mock
 
 from PIL import Image
 
@@ -699,6 +700,35 @@ class TemporalSelectionTests(unittest.TestCase):
         self.assertEqual(len(boxes), 9)
         self.assertEqual(boxes[0][1], [0.0, 0.0, 0.5, 0.5])
         self.assertEqual(boxes[-1][1], [0.5, 0.5, 1.0, 1.0])
+        fine_boxes = runner.spatial_tile_boxes("fine")
+        self.assertEqual(len(fine_boxes), 9)
+        self.assertEqual(fine_boxes[0][1], [0.0, 0.0, 0.4, 0.4])
+        self.assertEqual(fine_boxes[-1][1], [0.6, 0.6, 1.0, 1.0])
+        with self.assertRaises(ValueError):
+            runner.spatial_tile_boxes("unknown")
+
+    def test_tile_rescue_uses_fine_scale_after_coarse_failure(self) -> None:
+        rescued = {"target_present": True, "spatial_tile_scale": "fine"}
+        with mock.patch.object(
+            runner,
+            "_tile_rescue_frame_at_scale",
+            side_effect=[(None, {"stage": "coarse"}), (rescued, {"stage": "fine"})],
+        ) as search:
+            result, raw = runner.tile_rescue_frame(
+                mock.sentinel.qwen,
+                {"isolated_path": Path("source.jpg")},
+                {},
+                Path("frame.jpg"),
+                Path("work"),
+                "window_1",
+                30,
+            )
+        self.assertEqual(result, rescued)
+        self.assertEqual(raw["selected_tile_scale"], "fine")
+        self.assertEqual(
+            [call.args[-1] for call in search.call_args_list],
+            ["coarse", "fine"],
+        )
 
 
 if __name__ == "__main__":

@@ -22,7 +22,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 CASE_GLOB = "*__*"
 EVIDENCE_SCHEMA_VERSION = 5
-WINDOW_VERIFICATION_SCHEMA_VERSION = 11
+WINDOW_VERIFICATION_SCHEMA_VERSION = 12
 RESULT_SCHEMA_VERSION = 14
 FINAL_RESULT_SCHEMA_VERSION = 14
 CONFIRMED_THRESHOLD = 0.50
@@ -35,7 +35,7 @@ MAX_OCCURRENCE_GAP = 4
 MAX_WINDOWS_TO_VERIFY = 8
 MAX_REFINEMENT_SEEDS_PER_CAMERA = 6
 MAX_TILE_RESCUE_WINDOWS = MAX_WINDOWS_TO_VERIFY
-MAX_TILE_RESCUE_FRAMES_PER_WINDOW = 2
+MAX_TILE_RESCUE_FRAMES_PER_WINDOW = 3
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
 FRAME_ID_RE = re.compile(r"(\d+)(?!.*\d)")
 
@@ -838,11 +838,18 @@ def make_candidate_identity_panel(
     return output
 
 
-def spatial_tile_boxes() -> list[tuple[str, list[float]]]:
-    """Return overlapping half-frame tiles that cover borders and center."""
-    starts = (0.0, 0.25, 0.5)
+def spatial_tile_boxes(tile_scale: str = "coarse") -> list[tuple[str, list[float]]]:
+    """Return nine tiles, with a finer second scale for distant targets."""
+    if tile_scale == "coarse":
+        starts = (0.0, 0.25, 0.5)
+        extent = 0.5
+    elif tile_scale == "fine":
+        starts = (0.0, 0.3, 0.6)
+        extent = 0.4
+    else:
+        raise ValueError(f"Unsupported spatial tile scale: {tile_scale}")
     return [
-        (f"r{row}c{column}", [left, top, left + 0.5, top + 0.5])
+        (f"r{row}c{column}", [left, top, left + extent, top + extent])
         for row, top in enumerate(starts)
         for column, left in enumerate(starts)
     ]
@@ -873,9 +880,10 @@ def make_spatial_tile_panels(
     work_case: Path,
     window_id: str,
     frame_id: int,
+    tile_scale: str = "coarse",
 ) -> tuple[list[Path], dict[str, list[float]], dict[str, Path]]:
-    output_dir = work_case / "spatial_tile_panels_v1" / window_id
-    crop_dir = work_case / "spatial_tile_crops_v1" / window_id
+    output_dir = work_case / "spatial_tile_panels_v2" / tile_scale / window_id
+    crop_dir = work_case / "spatial_tile_crops_v2" / tile_scale / window_id
     output_dir.mkdir(parents=True, exist_ok=True)
     crop_dir.mkdir(parents=True, exist_ok=True)
     frame = Image.open(frame_path).convert("RGB")
@@ -883,7 +891,7 @@ def make_spatial_tile_panels(
     tile_map: dict[str, list[float]] = {}
     crop_map: dict[str, Path] = {}
     paths: list[Path] = []
-    for tile_id, box in spatial_tile_boxes():
+    for tile_id, box in spatial_tile_boxes(tile_scale):
         tile_map[tile_id] = box
         output = output_dir / f"frame_{frame_id:06d}_{tile_id}.jpg"
         crop_output = crop_dir / f"frame_{frame_id:06d}_{tile_id}.jpg"
@@ -933,7 +941,7 @@ def make_spatial_tile_panels(
     return paths, tile_map, crop_map
 
 
-def tile_rescue_frame(
+def _tile_rescue_frame_at_scale(
     qwen: "Qwen",
     anchor: Mapping[str, Any],
     identity: Mapping[str, Any],
@@ -941,21 +949,23 @@ def tile_rescue_frame(
     work_case: Path,
     window_id: str,
     frame_id: int,
+    tile_scale: str,
 ) -> tuple[dict[str, Any] | None, Any]:
-    """Search enlarged overlapping regions after full-frame localization fails."""
+    """Search one scale of enlarged regions after localization fails."""
     panels, tile_map, crop_map = make_spatial_tile_panels(
         frame_path,
         anchor["isolated_path"],
         work_case,
         window_id,
         frame_id,
+        tile_scale,
     )
     image_map = [
         {"image_number": index + 1, "tile_id": tile_id, "frame_region": box}
         for index, (tile_id, box) in enumerate(tile_map.items())
     ]
     prompt = f"""
-Search one third-person frame using nine overlapping enlarged regions.
+Search one third-person frame using nine {tile_scale}-scale enlarged regions.
 Each image repeats the authoritative first-person masked RGB object on the
 LEFT and one third-person spatial tile on the RIGHT.
 
@@ -1098,9 +1108,41 @@ Return JSON only:
         "target_present": True,
         "bbox_xyxy_normalized": box,
         "localization_method": "overlapping_tile_search",
+        "spatial_tile_scale": tile_scale,
         "tile_id": tile_id,
         **check,
     }, raw
+
+
+def tile_rescue_frame(
+    qwen: "Qwen",
+    anchor: Mapping[str, Any],
+    identity: Mapping[str, Any],
+    frame_path: Path,
+    work_case: Path,
+    window_id: str,
+    frame_id: int,
+) -> tuple[dict[str, Any] | None, Any]:
+    """Search coarse tiles first, then zoom further for distant targets."""
+    attempts: list[dict[str, Any]] = []
+    for tile_scale in ("coarse", "fine"):
+        rescued, raw = _tile_rescue_frame_at_scale(
+            qwen,
+            anchor,
+            identity,
+            frame_path,
+            work_case,
+            window_id,
+            frame_id,
+            tile_scale,
+        )
+        attempts.append({"tile_scale": tile_scale, "response": raw})
+        if rescued is not None:
+            return rescued, {
+                "selected_tile_scale": tile_scale,
+                "attempts": attempts,
+            }
+    return None, {"selected_tile_scale": None, "attempts": attempts}
 
 
 class Qwen:
