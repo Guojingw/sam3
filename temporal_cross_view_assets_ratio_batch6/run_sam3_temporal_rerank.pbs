@@ -1,0 +1,38 @@
+#!/bin/bash
+#PBS -P personal-gwang016
+#PBS -q normal
+#PBS -l select=1:ncpus=8:ngpus=1:mem=64gb
+#PBS -l walltime=04:00:00
+#PBS -N sam3_final_masks
+#PBS -j oe
+
+set -euo pipefail
+
+REPO="$HOME/worldmodel/sam3"
+RUNNER_DIR="$REPO/temporal_cross_view_assets_ratio_batch6"
+ASSETS="${ASSETS:-$HOME/scratch/temporal_cross_view_assets_ratio_easy6}"
+WORK_DIR="${WORK_DIR:-$HOME/scratch/qwen35-4b/temporal_easy6_native_tiles_v3}"
+PYTHON="$HOME/.conda/envs/sam3/bin/python"
+
+export HF_HOME="${HF_HOME:-$HOME/scratch/hf_cache}"
+export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
+export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
+
+cd "$RUNNER_DIR"
+nvidia-smi
+
+ARGS=(
+  --assets-root "$ASSETS"
+  --work-dir "$WORK_DIR"
+)
+if [[ -n "${CASE_FILTER:-}" ]]; then
+  ARGS+=(--case "$CASE_FILTER")
+fi
+if [[ -n "${SAM3_CHECKPOINT:-}" ]]; then
+  ARGS+=(--checkpoint "$SAM3_CHECKPOINT")
+fi
+if [[ -n "${SUMMARY_PATH:-}" ]]; then
+  ARGS+=(--summary-path "$SUMMARY_PATH")
+fi
+
+"$PYTHON" sam3_temporal_reranker.py "${ARGS[@]}"

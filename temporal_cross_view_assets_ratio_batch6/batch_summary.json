@@ -1,0 +1,84 @@
+{
+  "schema_version": 2,
+  "windowing_mode": "camera_relative_ratio",
+  "data_root": "/scratch/users/ntu/gwang016/datasets/Ego-Exo4D-Relation-Test/extracted/work/yuqian_fu/Ego/data_segswap_test",
+  "output_root": "/scratch/users/ntu/gwang016/temporal_cross_view_assets_ratio_batch6",
+  "window_ratios": [
+    0.2,
+    0.25,
+    0.3
+  ],
+  "window_stride_ratio": 0.05,
+  "requested_case_count": 6,
+  "generated_count": 6,
+  "failed_count": 0,
+  "skipped_count": 0,
+  "cases": [
+    {
+      "case_id": "0099226c-9bec-44aa-ba43-2b90eb7b8379__stainless_bowl_0",
+      "status": "generated",
+      "path": "/scratch/users/ntu/gwang016/temporal_cross_view_assets_ratio_batch6/0099226c-9bec-44aa-ba43-2b90eb7b8379__stainless_bowl_0",
+      "target_object": "stainless bowl_0",
+      "source_best_view": "aria01_214-1",
+      "source_best_frame": 3450,
+      "source_mask_area_ratio": 0.03918709242639463,
+      "target_window_count": 51,
+      "warnings": 0
+    },
+    {
+      "case_id": "0099226c-9bec-44aa-ba43-2b90eb7b8379__stainless_milk_container_0",
+      "status": "generated",
+      "path": "/scratch/users/ntu/gwang016/temporal_cross_view_assets_ratio_batch6/0099226c-9bec-44aa-ba43-2b90eb7b8379__stainless_milk_container_0",
+      "target_object": "stainless milk container_0",
+      "source_best_view": "aria01_214-1",
+      "source_best_frame": 960,
+      "source_mask_area_ratio": 0.02920607889979339,
+      "target_window_count": 51,
+      "warnings": 0
+    },
+    {
+      "case_id": "0099226c-9bec-44aa-ba43-2b90eb7b8379__stainless_pakkad_0",
+      "status": "generated",
+      "path": "/scratch/users/ntu/gwang016/temporal_cross_view_assets_ratio_batch6/0099226c-9bec-44aa-ba43-2b90eb7b8379__stainless_pakkad_0",
+      "target_object": "stainless pakkad_0",
+      "source_best_view": "aria01_214-1",
+      "source_best_frame": 3630,
+      "source_mask_area_ratio": 0.011332866574121902,
+      "target_window_count": 51,
+      "warnings": 0
+    },
+    {
+      "case_id": "0099226c-9bec-44aa-ba43-2b90eb7b8379__sugar_container_0",
+      "status": "generated",
+      "path": "/scratch/users/ntu/gwang016/temporal_cross_view_assets_ratio_batch6/0099226c-9bec-44aa-ba43-2b90eb7b8379__sugar_container_0",
+      "target_object": "sugar container_0",
+      "source_best_view": "aria01_214-1",
+      "source_best_frame": 1650,
+      "source_mask_area_ratio": 0.034997861247417356,
+      "target_window_count": 51,
+      "warnings": 0
+    },
+    {
+      "case_id": "0099226c-9bec-44aa-ba43-2b90eb7b8379__tea_container_0",
+      "status": "generated",
+      "path": "/scratch/users/ntu/gwang016/temporal_cross_view_assets_ratio_batch6/0099226c-9bec-44aa-ba43-2b90eb7b8379__tea_container_0",
+      "target_object": "tea container_0",
+      "source_best_view": "aria01_214-1",
+      "source_best_frame": 1320,
+      "source_mask_area_ratio": 0.04108876630294422,
+      "target_window_count": 51,
+      "warnings": 0
+    },
+    {
+      "case_id": "0099226c-9bec-44aa-ba43-2b90eb7b8379__yellow_tea_strainer_0",
+      "status": "generated",
+      "path": "/scratch/users/ntu/gwang016/temporal_cross_view_assets_ratio_batch6/0099226c-9bec-44aa-ba43-2b90eb7b8379__yellow_tea_strainer_0",
+      "target_object": "yellow tea strainer_0",
+      "source_best_view": "aria01_214-1",
+      "source_best_frame": 3870,
+      "source_mask_area_ratio": 0.011699581934400826,
+      "target_window_count": 51,
+      "warnings": 0
+    }
+  ]
+}

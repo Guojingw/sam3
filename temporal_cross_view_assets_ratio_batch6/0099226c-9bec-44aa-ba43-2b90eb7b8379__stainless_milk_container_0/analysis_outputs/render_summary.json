@@ -1,0 +1,43 @@
+{
+  "selected": {
+    "source_mask": "source_best_mask.png",
+    "source_sheet": "target_temporal_windows/cam01/window_0030_ratio_0.20_frames_2100_2940.jpg",
+    "output": "selected_best_segment_contact_sheet.jpg",
+    "drawn_region_frames": [
+      1260,
+      1590,
+      1920,
+      2250,
+      2550
+    ]
+  },
+  "alternatives": [
+    {
+      "source_mask": "source_best_mask.png",
+      "source_sheet": "target_temporal_windows/cam01/window_0010_ratio_0.25_frames_630_1680.jpg",
+      "output": "alternative_segment_01.jpg",
+      "drawn_region_frames": []
+    },
+    {
+      "source_mask": "source_best_mask.png",
+      "source_sheet": "target_temporal_windows/cam01/window_0040_ratio_0.25_frames_2730_3780.jpg",
+      "output": "alternative_segment_02.jpg",
+      "drawn_region_frames": []
+    }
+  ],
+  "rejected": [
+    {
+      "source_mask": "source_best_mask.png",
+      "source_sheet": "target_temporal_windows/cam01/window_0000_ratio_0.20_frames_0_840.jpg",
+      "output": "rejected_segment_01.jpg",
+      "drawn_region_frames": []
+    },
+    {
+      "source_mask": "source_best_mask.png",
+      "source_sheet": "target_temporal_windows/cam01/window_0050_ratio_0.20_frames_3510_4350.jpg",
+      "output": "rejected_segment_02.jpg",
+      "drawn_region_frames": []
+    }
+  ],
+  "warnings": []
+}

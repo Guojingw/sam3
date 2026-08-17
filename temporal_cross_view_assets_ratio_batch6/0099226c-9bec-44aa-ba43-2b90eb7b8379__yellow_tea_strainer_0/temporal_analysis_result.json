@@ -1,0 +1,143 @@
+{
+  "schema_version": 2,
+  "case_id": "0099226c-9bec-44aa-ba43-2b90eb7b8379__yellow_tea_strainer_0",
+  "target_object": "yellow_tea_strainer_0",
+  "source_best_view": "aria01_214-1",
+  "source_best_frame": 3870,
+  "source_best_mask": "source_best_mask.png",
+  "source_best_mask_overlay": "source_best_mask_overlay.png",
+  "source_mask_area_ratio": 0.011699581934400826,
+  "status": "success",
+  "best_cam": "cam01",
+  "best_segment": {
+    "window_id": "cam01_window_0050",
+    "cam": "cam01",
+    "start_frame": 3510,
+    "end_frame": 4350,
+    "requested_video_ratio": 0.2,
+    "actual_sampled_frame_ratio": 0.19863013698630136,
+    "actual_frame_span_ratio": 0.19310344827586207,
+    "representative_frames": [
+      {
+        "frame_id": 3510,
+        "target_region_xyxy": [
+          0.43,
+          0.58,
+          0.62,
+          0.79
+        ],
+        "visibility": 0.86,
+        "occlusion": "low"
+      },
+      {
+        "frame_id": 3720,
+        "target_region_xyxy": [
+          0.43,
+          0.58,
+          0.62,
+          0.79
+        ],
+        "visibility": 0.82,
+        "occlusion": "low"
+      },
+      {
+        "frame_id": 3930,
+        "target_region_xyxy": [
+          0.43,
+          0.58,
+          0.62,
+          0.79
+        ],
+        "visibility": 0.79,
+        "occlusion": "medium"
+      },
+      {
+        "frame_id": 4140,
+        "target_region_xyxy": [
+          0.43,
+          0.58,
+          0.62,
+          0.79
+        ],
+        "visibility": 0.77,
+        "occlusion": "medium"
+      },
+      {
+        "frame_id": 4350,
+        "target_region_xyxy": [
+          0.43,
+          0.58,
+          0.62,
+          0.79
+        ],
+        "visibility": 0.76,
+        "occlusion": "low"
+      }
+    ],
+    "target_region_summary": {
+      "coordinate_system": "normalized_xyxy_per_frame",
+      "stable_region_xyxy": [
+        0.43,
+        0.58,
+        0.62,
+        0.79
+      ],
+      "position_drift": "low",
+      "scale_change": "low",
+      "region_explanation": "This box is the third-view localization of the object indicated by source_best_mask_overlay.png, estimated frame-by-frame within the selected occurrence span."
+    },
+    "scores": {
+      "visibility_consistency": 0.84,
+      "average_apparent_size": 0.79,
+      "minimum_apparent_size": 0.74,
+      "occlusion_consistency": 0.75,
+      "identity_confidence": 0.66,
+      "segmentation_suitability": 0.8,
+      "temporal_stability": 0.82,
+      "overall": 0.66
+    },
+    "confidence": 0.66,
+    "reason_selected": "The selection is anchored on source_best_mask_overlay.png in the first view, then traced to the third-person camera timeline; among the object's visible appearance spans, this continuous 20%-30% window is the best balance of visibility, identity consistency, and propagation stability.",
+    "recommended_sam_prompt": "Seed on the occurrence-aligned the strainer basket and handle; avoid the hand and the pot."
+  },
+  "alternative_segments": [
+    {
+      "window_id": "cam01_window_0010",
+      "cam": "cam01",
+      "start_frame": 630,
+      "end_frame": 1680,
+      "requested_video_ratio": 0.25,
+      "actual_sampled_frame_ratio": 0.2465753424657534,
+      "actual_frame_span_ratio": 0.2413793103448276,
+      "reason": "Earlier but more transitional and less stable overall."
+    },
+    {
+      "window_id": "cam01_window_0040",
+      "cam": "cam01",
+      "start_frame": 2730,
+      "end_frame": 3780,
+      "requested_video_ratio": 0.25,
+      "actual_sampled_frame_ratio": 0.2465753424657534,
+      "actual_frame_span_ratio": 0.2413793103448276,
+      "reason": "Later segment is usable but has more occlusion and drift."
+    }
+  ],
+  "rejected_segments": [
+    {
+      "window_id": "cam01_window_0000",
+      "cam": "cam01",
+      "start_frame": 0,
+      "end_frame": 840,
+      "reason": "Too early and incomplete for sustained object visibility."
+    },
+    {
+      "window_id": "cam01_window_0050",
+      "cam": "cam01",
+      "start_frame": 3510,
+      "end_frame": 4350,
+      "reason": "Late cleanup/exit frames are less suitable for propagation."
+    }
+  ],
+  "uncertainty": "",
+  "confidence": 0.66
+}
