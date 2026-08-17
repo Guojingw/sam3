@@ -27,9 +27,12 @@ only adds display masks.
    and samples up to three separated frames from that window. This improves
    distant and partially visible targets without lowering identity thresholds.
    When those individual crops remain incomplete, one final temporal-consensus
-   check may combine identity cues across the rescued frames. It requires at
-   least two independently well-localized frames, two collective physical cues,
-   confidence of at least 0.85, and no conflicting cue.
+   check may combine identity cues across the rescued frames. This output is
+   diagnostic only: repeated sightings of the same wrong object cannot create
+   `target_present`, change window scoring, or promote `uncertain` to `success`.
+   A successful window requires at least one strict single-frame crop anchor
+   with two physical cues, at least one instance-specific cue, no conflict, and
+   no visible source-versus-candidate difference.
 5. Deterministic scoring selects the final continuous window. The result is
    saved in both `best_segment` and `qwen_temporal_selection`.
 6. A brief occurrence may be accepted from one independently crop-verified
@@ -128,7 +131,11 @@ old verification cache is automatically replaced. For one case:
   --case '<case_id>'
 ```
 
-After schema-13 window verifications exist, later scoring-only code changes can
+Candidate identity panels are written under `candidate_identity_panels_v4`.
+Their filenames contain the normalized bbox, so a rerun cannot silently reuse
+a panel rendered for an obsolete box.
+
+After schema-14 window verifications exist, later scoring-only code changes can
 be applied with `--rescore-only`. SAM3 submission is optional:
 
 ```bash

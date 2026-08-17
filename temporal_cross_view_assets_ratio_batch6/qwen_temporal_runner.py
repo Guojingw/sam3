@@ -22,7 +22,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 CASE_GLOB = "*__*"
 EVIDENCE_SCHEMA_VERSION = 5
-WINDOW_VERIFICATION_SCHEMA_VERSION = 13
+WINDOW_VERIFICATION_SCHEMA_VERSION = 14
 RESULT_SCHEMA_VERSION = 14
 FINAL_RESULT_SCHEMA_VERSION = 14
 CONFIRMED_THRESHOLD = 0.50
@@ -186,7 +186,9 @@ def normalize_string_list(value: Any) -> list[str]:
 
 
 def candidate_identity_check(
-    raw: Mapping[str, Any], box: Sequence[float] | None = None
+    raw: Mapping[str, Any],
+    box: Sequence[float] | None = None,
+    require_instance_specific: bool = True,
 ) -> dict[str, Any]:
     """Require multiple visible identity cues, not a color-only resemblance."""
     try:
@@ -196,13 +198,21 @@ def candidate_identity_check(
     except (TypeError, ValueError):
         confidence = 0.0
     matched_cues = normalize_string_list(raw.get("matched_visible_cues"))
+    instance_specific_cues = normalize_string_list(
+        raw.get("instance_specific_cues")
+    )
     conflicting_cues = normalize_string_list(raw.get("conflicting_visible_cues"))
+    source_candidate_differences = normalize_string_list(
+        raw.get("source_candidate_differences")
+    )
     accepted = bool(
         model_bool(raw.get("same_object_type"))
         and model_bool(raw.get("candidate_crop_is_visually_verifiable"))
         and confidence >= 0.70
         and len(matched_cues) >= 2
+        and (instance_specific_cues or not require_instance_specific)
         and not conflicting_cues
+        and not source_candidate_differences
     )
     return {
         "identity_check_passed": accepted,
@@ -211,7 +221,9 @@ def candidate_identity_check(
             raw.get("candidate_crop_is_visually_verifiable")
         ),
         "matched_visible_cues": matched_cues,
+        "instance_specific_cues": instance_specific_cues,
         "conflicting_visible_cues": conflicting_cues,
+        "source_candidate_differences": source_candidate_differences,
         "identity_confidence": confidence if accepted else 0.0,
         **presentation_metrics(raw, box),
     }
@@ -774,9 +786,12 @@ def make_candidate_identity_panel(
     variant: str = "full",
 ) -> Path:
     """Enlarge a proposed target without hiding its surrounding context."""
-    output_dir = work_case / "candidate_identity_panels_v3"
+    output_dir = work_case / "candidate_identity_panels_v4"
     output_dir.mkdir(parents=True, exist_ok=True)
-    output = output_dir / f"{window_id}_{frame_id:06d}_{variant}.jpg"
+    box_tag = "_".join(f"{round(float(value) * 10000):04d}" for value in box)
+    output = output_dir / (
+        f"{window_id}_{frame_id:06d}_{variant}_box_{box_tag}.jpg"
+    )
     if output.exists():
         return output
 
@@ -979,8 +994,13 @@ Tile mapping:
 
 Return at most one best candidate. Color alone is never sufficient. A match
 must expose at least two distinct physical identity cues and no conflicting
-cue. Reject people, hands, appliances, controls, reflections, and background
-patches. If no tile is visually sufficient, return best_candidate=null.
+cue. At least one cue must be instance-specific, such as label geometry, cap
+construction, distinctive rim/handle arrangement, or a unique part pattern;
+generic color, material, and category shape do not qualify. Explicitly list
+every visible difference between source and candidate. Reject people, hands,
+appliances, controls, reflections, background patches, and a different object
+of the same category. If no tile is visually sufficient, return
+best_candidate=null.
 The bbox is normalized inside the RIGHT tile, not the full frame.
 
 Return JSON only:
@@ -992,7 +1012,9 @@ Return JSON only:
     "candidate_crop_is_visually_verifiable": false,
     "same_object_type": false,
     "matched_visible_cues": [],
+    "instance_specific_cues": [],
     "conflicting_visible_cues": [],
+    "source_candidate_differences": [],
     "identity_confidence": 0.0
   }}
 }}
@@ -1008,7 +1030,9 @@ Return JSON only:
     tile_id = str(candidate.get("tile_id", ""))
     if tile_id not in tile_map:
         return None, {"search": search_raw, "verification": None}
-    search_check = candidate_identity_check(candidate)
+    search_check = candidate_identity_check(
+        candidate, require_instance_specific=False
+    )
     if not search_check["identity_check_passed"]:
         return None, {"search": search_raw, "verification": None}
 
@@ -1071,8 +1095,13 @@ Authoritative source identity:
 {json.dumps(identity, ensure_ascii=False)}
 
 Color alone is insufficient. Require at least two directly visible physical
-cues and no conflicting cue. If tiny, blurred, incomplete, or a nearby object,
-set candidate_crop_is_visually_verifiable=false.
+cues and no conflicting cue. At least one must be instance-specific, such as
+matching label geometry, cap construction, rim/handle arrangement, or a unique
+part pattern. Generic category shape, material, and color do not qualify as an
+instance-specific cue. List every visible source-versus-candidate difference;
+a different cap, label, proportion, contents, or attachment is disqualifying.
+If tiny, blurred, incomplete, or a nearby object, set
+candidate_crop_is_visually_verifiable=false.
 Score object_completeness, bbox_tightness, and object_fill_fraction_in_bbox
 independently from identity; a box containing substantial background must have
 low tightness and fill scores.
@@ -1082,7 +1111,9 @@ Return JSON only:
   "candidate_crop_is_visually_verifiable": false,
   "same_object_type": false,
   "matched_visible_cues": [],
+  "instance_specific_cues": [],
   "conflicting_visible_cues": [],
+  "source_candidate_differences": [],
   "identity_confidence": 0.0,
   "object_completeness": 0.0,
   "bbox_tightness": 0.0,
@@ -2507,8 +2538,13 @@ Authoritative source identity:
 Evaluate the enlarged RIGHT crop in every proposal. Color similarity alone is
 never sufficient. Require at least two distinct, directly visible physical
 cues such as shape, part arrangement, cap/handle/rim structure, material, or
-label geometry. A color patch, reflection, utensil, appliance control, hand, or
-background item is not the masked object. If the crop is too tiny, blurred, or
+label geometry. At least one must be instance-specific: matching label
+geometry, cap construction, distinctive rim/handle arrangement, or a unique
+part pattern. Generic color, material, and category shape are not
+instance-specific. Explicitly compare cap, label, proportions, contents, and
+attachments and list every visible difference. A color patch, reflection,
+utensil, appliance control, hand, background item, or different same-category
+object is not the masked object. If the crop is too tiny, blurred, or
 incomplete to verify those cues, set
 candidate_crop_is_visually_verifiable=false. List any visible feature that
 conflicts with the source. Do not trust the earlier bbox.
@@ -2528,7 +2564,9 @@ Return JSON only with exactly one entry per mapped frame:
       "candidate_crop_is_visually_verifiable": false,
       "same_object_type": false,
       "matched_visible_cues": [],
+      "instance_specific_cues": [],
       "conflicting_visible_cues": [],
+      "source_candidate_differences": [],
       "identity_confidence": 0.0,
       "object_completeness": 0.0,
       "bbox_tightness": 0.0,
@@ -2567,7 +2605,11 @@ Return JSON only with exactly one entry per mapped frame:
         positives = [item for item in frame_results if item["target_present"]]
         tile_rescue_raw: list[dict[str, Any]] = []
         temporal_consensus_raw: Any = None
-        temporal_consensus_summary = temporal_consensus_check({})
+        temporal_consensus_summary = {
+            **temporal_consensus_check({}),
+            "role": "diagnostic_only",
+            "changes_temporal_selection": False,
+        }
         if len(positives) < 2 and window_id in tile_rescue_window_ids:
             positions = {
                 frame_id: index for index, frame_id in enumerate(target_frame_ids)
@@ -2632,37 +2674,11 @@ Return JSON only with exactly one entry per mapped frame:
                     tile_rescue_raw,
                 )
             )
-            if temporal_consensus_summary["temporal_consensus_passed"]:
-                accepted_by_frame = {
-                    int(item["frame_id"]): item
-                    for item in temporal_consensus_summary["accepted_frames"]
-                }
-                for item in frame_results:
-                    accepted = accepted_by_frame.get(int(item["frame_id"]))
-                    if accepted is None:
-                        continue
-                    item.update(accepted)
-                    item.update(
-                        {
-                            "presence": "confirmed",
-                            "target_present": True,
-                            "localization_method": "multiframe_tile_consensus",
-                            "identity_verification_mode": "temporal_consensus",
-                            "identity_check_passed": True,
-                            "same_object_type": True,
-                            "candidate_crop_is_visually_verifiable": True,
-                            "identity_confidence": temporal_consensus_summary[
-                                "identity_confidence"
-                            ],
-                            "matched_visible_cues": temporal_consensus_summary[
-                                "matched_visible_cues"
-                            ],
-                            "conflicting_visible_cues": [],
-                        }
-                    )
-                positives = [
-                    item for item in frame_results if item["target_present"]
-                ]
+            temporal_consensus_summary = {
+                **temporal_consensus_summary,
+                "role": "diagnostic_only",
+                "changes_temporal_selection": False,
+            }
         representative = max(
             positives,
             key=lambda item: float(item["identity_confidence"]),
@@ -2671,18 +2687,15 @@ Return JSON only with exactly one entry per mapped frame:
         strong_positives = [
             item
             for item in positives
-            if (
-                float(item.get("identity_confidence", 0.0))
-                >= STRONG_SINGLE_MATCH_CONFIDENCE
-                or (
-                    item.get("identity_verification_mode")
-                    == "temporal_consensus"
-                    and float(item.get("identity_confidence", 0.0))
-                    >= TEMPORAL_CONSENSUS_CONFIDENCE
-                )
-            )
+            if float(item.get("identity_confidence", 0.0))
+            >= STRONG_SINGLE_MATCH_CONFIDENCE
+            and item.get("identity_verification_mode") != "temporal_consensus"
             and len(normalize_string_list(item.get("matched_visible_cues"))) >= 2
+            and normalize_string_list(item.get("instance_specific_cues"))
             and not normalize_string_list(item.get("conflicting_visible_cues"))
+            and not normalize_string_list(
+                item.get("source_candidate_differences")
+            )
         ]
         thirds = max(1, len(target_frame_ids) // 3)
         cached[window_id] = {
@@ -2780,11 +2793,14 @@ def strong_crop_verified_frames(
         item
         for item in (verification or {}).get("frame_results", [])
         if item.get("target_present")
+        and item.get("identity_verification_mode") != "temporal_consensus"
         and item.get("bbox_xyxy_normalized")
         and float(item.get("identity_confidence", 0.0))
         >= STRONG_SINGLE_MATCH_CONFIDENCE
         and len(normalize_string_list(item.get("matched_visible_cues"))) >= 2
+        and normalize_string_list(item.get("instance_specific_cues"))
         and not normalize_string_list(item.get("conflicting_visible_cues"))
+        and not normalize_string_list(item.get("source_candidate_differences"))
     ]
 
 
@@ -3037,8 +3053,9 @@ def analyze_windows(
         }
         result["uncertainty"] = (
             "No occurrence-fitted preferred-duration or best-effort short "
-            "window contains a confirmed localized scout and an independently "
-            "crop-verified strong identity match."
+            "window contains a strict single-frame crop anchor with an "
+            "instance-specific identity cue and no visible source-candidate "
+            "difference. Temporal consensus is diagnostic only."
         )
         result["confidence"] = round(
             max((entry[2]["overall"] for entry in candidates), default=0.0), 4

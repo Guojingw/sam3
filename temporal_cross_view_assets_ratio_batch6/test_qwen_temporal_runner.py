@@ -82,7 +82,9 @@ class TemporalSelectionTests(unittest.TestCase):
                             "bbox_xyxy_normalized": [0.25, 0.25, 0.45, 0.55],
                             "identity_confidence": 0.9,
                             "matched_visible_cues": ["shape", "material"],
+                            "instance_specific_cues": ["distinctive rim pattern"],
                             "conflicting_visible_cues": [],
+                            "source_candidate_differences": [],
                         }
                     ],
                     "representative_frame_id": representative["frame_id"],
@@ -271,7 +273,9 @@ class TemporalSelectionTests(unittest.TestCase):
                     "bbox_xyxy_normalized": [0.25, 0.25, 0.45, 0.55],
                     "identity_confidence": 0.95,
                     "matched_visible_cues": ["distinct shape", "matching material"],
+                    "instance_specific_cues": ["distinctive part pattern"],
                     "conflicting_visible_cues": [],
+                    "source_candidate_differences": [],
                     "presentation_quality": 0.8,
                     "target_scale_score": 0.6,
                     "estimated_target_frame_fraction": 0.05,
@@ -464,7 +468,9 @@ class TemporalSelectionTests(unittest.TestCase):
                 "same_object_type": True,
                 "candidate_crop_is_visually_verifiable": True,
                 "matched_visible_cues": ["green screw cap", "red bottle body"],
+                "instance_specific_cues": ["green screw-cap construction"],
                 "conflicting_visible_cues": [],
+                "source_candidate_differences": [],
                 "identity_confidence": 0.9,
             }
         )
@@ -475,6 +481,28 @@ class TemporalSelectionTests(unittest.TestCase):
                 "matched_visible_cues": ["red color"],
                 "conflicting_visible_cues": [],
                 "identity_confidence": 0.95,
+            }
+        )
+        generic_two_cues = runner.candidate_identity_check(
+            {
+                "same_object_type": True,
+                "candidate_crop_is_visually_verifiable": True,
+                "matched_visible_cues": ["blue color", "plastic material"],
+                "instance_specific_cues": [],
+                "conflicting_visible_cues": [],
+                "source_candidate_differences": [],
+                "identity_confidence": 0.95,
+            }
+        )
+        visibly_different = runner.candidate_identity_check(
+            {
+                "same_object_type": True,
+                "candidate_crop_is_visually_verifiable": True,
+                "matched_visible_cues": ["bottle shape", "blue label"],
+                "instance_specific_cues": ["label geometry"],
+                "conflicting_visible_cues": [],
+                "source_candidate_differences": ["white cap instead of blue"],
+                "identity_confidence": 0.98,
             }
         )
         conflicted = runner.candidate_identity_check(
@@ -488,6 +516,8 @@ class TemporalSelectionTests(unittest.TestCase):
         )
         self.assertTrue(accepted["identity_check_passed"])
         self.assertFalse(color_only["identity_check_passed"])
+        self.assertFalse(generic_two_cues["identity_check_passed"])
+        self.assertFalse(visibly_different["identity_check_passed"])
         self.assertFalse(conflicted["identity_check_passed"])
 
     def test_presentation_metrics_reject_loose_box(self) -> None:
@@ -589,7 +619,9 @@ class TemporalSelectionTests(unittest.TestCase):
                         "bbox_xyxy_normalized": [0.2, 0.2, 0.5, 0.5],
                         "identity_confidence": 0.9,
                         "matched_visible_cues": ["shape", "material"],
+                        "instance_specific_cues": ["distinctive label geometry"],
                         "conflicting_visible_cues": [],
+                        "source_candidate_differences": [],
                         "presentation_quality": 0.9,
                         "target_scale_score": scale,
                         "estimated_target_frame_fraction": 0.08 * scale,
@@ -646,6 +678,16 @@ class TemporalSelectionTests(unittest.TestCase):
             )
             with Image.open(panel_path) as panel:
                 self.assertEqual(panel.size, (1760, 500))
+            changed_box_panel = runner.make_candidate_identity_panel(
+                frame,
+                source,
+                [0.40, 0.35, 0.60, 0.65],
+                root,
+                "window",
+                30,
+            )
+            self.assertNotEqual(panel_path, changed_box_panel)
+            self.assertEqual(panel_path.parent.name, "candidate_identity_panels_v4")
 
     def test_frame_catalog_prefers_original_target_frame(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -825,6 +867,24 @@ class TemporalSelectionTests(unittest.TestCase):
         checked = runner.temporal_consensus_check(response)
         self.assertTrue(checked["temporal_consensus_passed"])
         self.assertEqual(len(checked["accepted_frames"]), 2)
+
+    def test_temporal_consensus_cannot_become_strict_identity_anchor(self) -> None:
+        verification = {
+            "frame_results": [
+                {
+                    "frame_id": 30,
+                    "target_present": True,
+                    "identity_verification_mode": "temporal_consensus",
+                    "bbox_xyxy_normalized": [0.2, 0.2, 0.3, 0.3],
+                    "identity_confidence": 0.99,
+                    "matched_visible_cues": ["label", "cap"],
+                    "instance_specific_cues": ["label geometry"],
+                    "conflicting_visible_cues": [],
+                    "source_candidate_differences": [],
+                }
+            ]
+        }
+        self.assertEqual(runner.strong_crop_verified_frames(verification), [])
 
 
 if __name__ == "__main__":
